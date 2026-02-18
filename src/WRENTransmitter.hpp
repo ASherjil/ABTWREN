@@ -5,7 +5,7 @@
 #ifndef ABTWREN_WRENTRANSMITTER_H
 #define ABTWREN_WRENTRANSMITTER_H
 
-#include "WRENTransmitterRegisters.hpp"
+#include "WRENProtocol.hpp"
 #include <PCIeBackend.hpp>
 #include <PacketMmapTx.hpp>
 
@@ -14,14 +14,8 @@
 #include <cstring>
 #include <utility>
 
-constexpr std::size_t kMacLength    = 6;
-constexpr std::size_t kEthHdrLen    = 14;  // dst(6) + src(6) + ethertype(2)
-constexpr std::uint32_t kFrameSize  = 64;  // Minimum Ethernet frame — always send full size
-constexpr std::uint16_t kEtherType  = 0x88B5;   // IEEE local experimental
 constexpr int kMaxSlots = 64;
 constexpr int kMaxComp  = 256;
-
-enum PktType : std::uint8_t { PKT_ADVANCE = 1, PKT_FIRE = 2 };
 
 struct LtimTarget {
     std::uint16_t event_id;

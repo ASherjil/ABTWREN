@@ -52,3 +52,17 @@ target_link_libraries(wren_transmitter
     PUBLIC  fpga_backend abtrda3
     PRIVATE abtwren_flags
 )
+
+# ── WREN Receiver library ───────────────────────────────────────
+add_library(wren_receiver STATIC
+    src/WRENReceiver.cpp
+)
+
+target_include_directories(wren_receiver PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+)
+
+target_link_libraries(wren_receiver
+    PUBLIC  abtrda3
+    PRIVATE abtwren_flags
+)
