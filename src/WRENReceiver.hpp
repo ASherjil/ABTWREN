@@ -8,6 +8,7 @@
 #include "WRENProtocol.hpp"
 #include <PacketMmapRx.hpp>
 
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,16 +18,19 @@ public:
   explicit WRENReceiver(const RingConfig& cfg /* TODO: SPSCQueue& queue*/);
 
   WRENReceiver(const WRENReceiver&) = delete;
-  WRENReceiver(WRENReceiver&& other) noexcept;
+  WRENReceiver(WRENReceiver&& other) noexcept = default; 
 
   WRENReceiver& operator=(const WRENReceiver&) = delete;
-  WRENReceiver& operator=(WRENReceiver&& other) noexcept;
+  WRENReceiver& operator=(WRENReceiver&& other) noexcept = default;
 
   ~WRENReceiver() = default;
 
-  [[noreturn]]
-  void beginReceiving() {
-    while (true) {
+  // Polls until 'running' goes false (set by watchdog / SIGINT).
+  // Checks the flag every 65536 idle spins (~65ms) — zero overhead on hot path.
+  void beginReceiving(const volatile std::sig_atomic_t& running) {
+    std::uint32_t spins = 0;
+
+    while (running) {
       RxFrame frame = m_ethernetSocket.tryReceive();
 
       if (!frame.data.empty()){
@@ -36,9 +40,13 @@ public:
 
           m_ethernetSocket.release();
         }
+        spins = 0;
+        continue;
       }
 
+      if ((++spins & 0xFFFF) == 0 && !running) break;
     }
+    std::fprintf(stderr, "[RX] Exiting poll loop.\n");
   }
 
   // TODO: This will be second thread that will pop the SPSC queue and fast forward to FESA real-time actions

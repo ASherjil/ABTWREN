@@ -10,7 +10,9 @@
 #include <PacketMmapTx.hpp>
 
 #include <array>
+#include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -115,20 +117,26 @@ public:
         m_ethernetSocket.commit();
     }
 
-    // ── Main busy-poll + forward loop (never returns) ────────────
+    // ── Main busy-poll + forward loop ───────────────────────────
+    //
+    // Polls until 'running' goes false (set by watchdog / SIGINT).
+    // Checks the flag every 65536 idle spins (~65ms) — zero overhead on hot path.
 
-    [[noreturn]]
-    void transmitAll() {
+    void transmitAll(const volatile std::sig_atomic_t& running) {
         // Sync shadow pointer to current firmware position
         m_shadowOff = *m_pcieHandler.registerPtr<std::uint32_t>(WREN_ASYNC_BOARD_OFF);
+        std::uint32_t spins = 0;
 
-        for (;;) {
+        while (running) {
             // ── Gate: 1 PCIe read (~1.0us) ───────────────────────
             std::uint32_t boardOff =
                 *m_pcieHandler.registerPtr<std::uint32_t>(WREN_ASYNC_BOARD_OFF);
 
-            if (boardOff == m_shadowOff) [[likely]]
+            if (boardOff == m_shadowOff) [[likely]] {
+                if ((++spins & 0xFFFF) == 0 && !running) break;
                 continue;
+            }
+            spins = 0;
 
             // ── Drain all new capsules ───────────────────────────
             do {
@@ -233,6 +241,7 @@ public:
 
             } while (m_shadowOff != boardOff);
         }
+        std::fprintf(stderr, "[TX] Exiting poll loop.\n");
     }
 
 

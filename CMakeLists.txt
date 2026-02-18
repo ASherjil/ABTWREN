@@ -66,3 +66,10 @@ target_link_libraries(wren_receiver
     PUBLIC  abtrda3
     PRIVATE abtwren_flags
 )
+
+# ── Main executable ─────────────────────────────────────────────
+add_executable(abtwren src/main.cpp)
+
+target_link_libraries(abtwren
+    PRIVATE wren_transmitter wren_receiver abtwren_flags
+)
