@@ -94,6 +94,23 @@ word 3: ts.nsec       (nanoseconds, raw — NOT cycles, despite firmware comment
 - `comp_idx` is NOT the LTIM channel number. Example: WRLTIM_0-23_EC (channel 23) → `comp_idx=1`.
 - Word order is reversed vs event capsule: pulse has `sec, nsec` (not `nsec, sec`).
 
+## Config Capsule Layout (typ=0x03)
+
+```
+word 0: header        { typ=0x03, source_idx, len=2 }
+word 1: identifiers   { act_idx[15:0], sw_cmp_idx[31:16] }
+```
+
+- `act_idx`: firmware action index (same as LTIM slot number from `wrentest ltim list`)
+- `sw_cmp_idx`: software comparator index (allocated by firmware, 0-511)
+- Written by firmware `async_send_config()` when a hardware comparator is loaded
+- Maps act_idx → sw_cmp_idx; PULSE capsule later reports sw_cmp_idx when it fires
+
+**Critical bug found (Feb 2026):** Our code confused act_idx with sw_cmp_idx.
+CONFIG gives `[act_idx:16][sw_cmp_idx:16]`, PULSE gives `sw_cmp_idx`.
+The correct reverse mapping: CONFIG populates `m_swCmpInfo[sw_cmp_idx]` with act_idx,
+then PULSE looks up `m_swCmpInfo[sw_cmp_idx]` to dispatch.
+
 ## Event ID Examples (from timing-domain-cern)
 
 | Name | Domain | Numeric ID |
@@ -153,6 +170,58 @@ P100 worst case: ~0.65us + ~3.5us = **~4.2us** (SMI hit on parse reads)
 **64-bit read optimization**: Adjacent 32-bit registers are paired into single `volatile uint64_t*`
 dereferences, cutting PCIe round-trips from 4 to 2 per capsule. 128-bit SSE (`_mm_loadu_si128`)
 was tested but regresses — CPU splits it into 4x 32-bit reads on UC MMIO (Intel SDM confirmed).
+
+## PCIe Mailbox Command Protocol
+
+The WREN firmware exposes a synchronous command/reply mailbox via PCIe BAR1.
+Used to configure conditions and actions at startup (not on hot path).
+
+**Register Offsets (from BAR1 base):**
+
+| Register | Offset | Direction |
+|----------|--------|-----------|
+| B2H CSR | 0x10000 | Read (poll for READY) |
+| B2H CMD | 0x10008 | Read (reply command) |
+| B2H LEN | 0x1000C | Read (reply length) |
+| B2H DATA | 0x10010 | Read (reply data words) |
+| H2B CSR | 0x11000 | Write MB_CSR_READY=1 to send |
+| H2B CMD | 0x11008 | Write command ID |
+| H2B LEN | 0x1100C | Write data length in words |
+| H2B DATA | 0x11010 | Write data words |
+
+**Handshake** (from `wren-core.c:484 wren_mb_msg`):
+1. Write data words to H2B_DATA
+2. Write command ID to H2B_CMD, length to H2B_LEN
+3. Write `MB_CSR_READY` (0x1) to H2B_CSR → firmware processes
+4. Poll B2H_CSR for `MB_CSR_READY`
+5. Read B2H_CMD: `& CMD_REPLY (0x80000000)` = success, `& CMD_ERROR (0x40000000)` = failure
+6. Write 0 to B2H_CSR to acknowledge
+
+**Key Command IDs** (from `wren-mb-cmds.def` enum):
+- `CMD_RX_SUBSCRIBE` = 38: subscribe to event ID on source/domain
+- `CMD_RX_SET_COND` = 18: create condition matching event ID
+- `CMD_RX_SET_ACTION` = 21: create action with pulser config + time offset
+
+**Safety:** Only send during startup. Firmware is single-threaded. Avoid concurrent
+mailbox access with kernel driver or wrentest. PCIe write ordering guarantees visibility.
+
+## 0-Offset CTIM Fire Actions
+
+To get CTIM fire at exact time T (not just ADVANCE seconds early):
+1. Subscribe to target CTIM event on source 0
+2. Create condition matching the event ID (high cond_idx to avoid LTIM conflicts)
+3. Create action with `load_off_sec=0, load_off_nsec=0` and INT_EN flag
+
+Firmware computes `due_time = event_ts + 0`, loads hardware comparator, which fires
+immediately → `pulses_handler()` writes `CMD_ASYNC_PULSE` to async ring.
+
+**Pulser config:**
+- pulser_idx=31 (dedicated, unused by LTIMs), flags=0x84 (INT_EN|ENABLE)
+- width/period/npulses/idelay: 0, load_off_sec/nsec: 0
+
+**Firmware limits:** MAX_RX_CONDS=1152, MAX_RX_ACTIONS=2048, NBR_SW_COMP=512,
+WREN_NBR_PULSERS=32, WREN_NBR_COMPARATORS=256.
+Use high indices (cond 1100+, act 2040+) to avoid LTIM driver conflicts.
 
 ## Forwarding Strategy
 
