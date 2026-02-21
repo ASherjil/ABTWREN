@@ -147,9 +147,7 @@ void WRENTransmitter::transmitAll(const volatile std::sig_atomic_t& running) {
             // ── FIRE path (latency-critical) ─────────────────
             case TYP_PULSE: {
                 auto comp = static_cast<std::uint16_t>(w1);
-                if (!m_compActive[comp]) {
-                    break;
-                }
+                if (!m_compActive[comp]) break;
 
                 std::uint32_t sec, nsec;
                 if (safe64) [[likely]] {
@@ -161,17 +159,34 @@ void WRENTransmitter::transmitAll(const volatile std::sig_atomic_t& running) {
                     sec  = readRingWord(m_shadowOff + 2);
                     nsec = readRingWord(m_shadowOff + 3);
                 }
-                sendFire(m_compToSlot[comp], sec, nsec);
+
+                const auto& info = m_compInfo[comp];
+                if (info.isCtim)
+                    sendCtimFire(info.eventId, sec, nsec);
+                else
+                    sendFire(info, sec, nsec);
                 break;
             }
 
-            // ── CONFIG: track sw_cmp <-> act_idx mapping ──────
-            // Activate unconditionally — transmitter forwards ALL fires.
-            // Classification (CTIM vs LTIM, channel mapping) belongs on consumer side.
+            // ── CONFIG: enrich sw_cmp with action metadata ────
+            // Look up act_idx in the action map to get eventId/channel/offset.
+            // This is NOT on the hot path (CONFIG arrives once per comparator load,
+            // well before the corresponding PULSE). Linear scan of ~20 entries is fine.
             case TYP_CONFIG: {
                 const auto actIdx = static_cast<std::uint16_t>(w1);
                 const auto swCmp  = static_cast<std::uint16_t>(w1 >> 16);
-                m_compToSlot[swCmp] = actIdx;
+
+                CompEntry entry{};
+                for (const auto& a : m_actionMap) {
+                    if (a.actIdx == actIdx) {
+                        entry.eventId  = a.eventId;
+                        entry.channel  = a.channel;
+                        entry.isCtim   = (a.offsetNs == 0);
+                        entry.offsetMs = static_cast<std::uint16_t>(a.offsetNs / 1'000'000);
+                        break;
+                    }
+                }
+                m_compInfo[swCmp] = entry;
                 m_compActive[swCmp] = true;
                 break;
             }

@@ -5,6 +5,9 @@
 // CMD_ASYNC_PULSE capsules at the exact CTIM fire time (0-offset actions).
 // Subscribes, creates conditions + actions at startup; deletes them in destructor.
 //
+// Also discovers all existing firmware actions at startup and builds a
+// lookup table mapping act_idx → {event_id, channel, offset_ns}.
+//
 
 #ifndef ABTWREN_WRENCTIMCONFIGURATOR_H
 #define ABTWREN_WRENCTIMCONFIGURATOR_H
@@ -30,8 +33,10 @@ constexpr std::uint32_t MB_CMD_ERROR = 0x40000000;
 // ── Command IDs (from wren-mb-cmds.def enum) ─────────────────────────
 constexpr std::uint32_t CMD_RX_SET_COND    = 18;
 constexpr std::uint32_t CMD_RX_DEL_COND    = 19;
+constexpr std::uint32_t CMD_RX_GET_COND    = 20;
 constexpr std::uint32_t CMD_RX_SET_ACTION  = 21;
 constexpr std::uint32_t CMD_RX_DEL_ACTION  = 22;
+constexpr std::uint32_t CMD_RX_GET_ACTION  = 24;
 constexpr std::uint32_t CMD_RX_SUBSCRIBE   = 38;
 
 // ── Pulser flags (from wren-mb-defs.h) ───────────────────────────────
@@ -54,6 +59,15 @@ struct CtimTarget {
     std::uint8_t  pulserIdx;
 };
 
+/// Discovered firmware action: maps act_idx to human-readable LTIM info.
+/// Built at startup by querying CMD_RX_GET_ACTION + CMD_RX_GET_COND.
+struct ActionInfo {
+    std::uint16_t actIdx;
+    std::uint16_t eventId;
+    std::uint8_t  channel;      // pulser_idx + 1 (wrentest 1-based display)
+    std::int64_t  offsetNs;     // idelay / clock_hz (from inputs field)
+};
+
 class WRENCTIMConfigurator {
 public:
     /// @param pcie     Reference to the PCIeBackend owned by WRENTransmitter.
@@ -73,13 +87,20 @@ public:
         return static_cast<std::uint16_t>(kCtimActBase + i);
     }
 
+    /// Discovered act_idx → LTIM mapping (populated at startup, never changes).
+    [[nodiscard]] const std::vector<ActionInfo>& actionMap() const { return m_actionMap; }
+
 private:
     bool mbSend(std::uint32_t cmd, const void* data, std::size_t words);
+    bool mbSendRecv(std::uint32_t cmd, const void* data, std::size_t words,
+                    void* reply, std::size_t replyWords);
     void setupAll();
     void cleanupAll();
+    void discoverActions();
 
     PCIeBackend& m_pcie;
     std::vector<CtimTarget> m_targets;
+    std::vector<ActionInfo> m_actionMap;
 };
 
 #endif // ABTWREN_WRENCTIMCONFIGURATOR_H

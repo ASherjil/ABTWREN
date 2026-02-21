@@ -6,6 +6,7 @@
 #define ABTWREN_WRENTRANSMITTER_H
 
 #include "WRENProtocol.hpp"
+#include "WRENCTIMConfigurator.hpp"
 #include <PCIeBackend.hpp>
 #include <PacketMmapTx.hpp>
 
@@ -15,9 +16,19 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 constexpr int kMaxSlots = 64;
 constexpr int kMaxComp  = 512;
+
+/// Metadata cached per sw_cmp_idx. Populated at CONFIG time from the action map,
+/// read at PULSE time to stamp enriched data into the wire packet.
+struct CompEntry {
+    std::uint16_t eventId{};
+    std::uint8_t  channel{};    // 1-based wrentest channel (0 = unknown)
+    bool          isCtim{};     // true for 0-offset CTIM fire actions
+    std::uint16_t offsetMs{};   // delay from CTIM time in ms (0 for CTIM fires)
+};
 
 struct LtimTarget {
     std::uint16_t event_id;
@@ -49,6 +60,11 @@ public:
 
     /// Access the PCIeBackend for shared use (e.g., WRENCTIMConfigurator).
     [[nodiscard]] PCIeBackend& pcie() { return m_pcieHandler; }
+
+    /// Install the discovered action map (act_idx → eventId/channel/offset).
+    /// Called once at startup before transmitAll(). The transmitter uses this
+    /// at CONFIG time to populate m_compInfo[] for zero-cost PULSE enrichment.
+    void installActionMap(const std::vector<ActionInfo>& map) { m_actionMap = map; }
 
     // Ethernet frame layout: [dst:0-5][src:6-11][ethertype:12-13][payload:14+]
     void setMacAddresses(const std::array<std::uint8_t, 6>& src, const std::array<std::uint8_t, 6>& dst);
@@ -105,15 +121,32 @@ public:
     }
 
     [[gnu::always_inline]]
-    inline void sendFire(std::uint16_t slot, std::uint32_t sec, std::uint32_t nsec) {
+    inline void sendFire(const CompEntry& info, std::uint32_t sec, std::uint32_t nsec) {
         auto* frame = m_ethernetSocket.acquire(kFrameSize);
         if (!frame) [[unlikely]] return;
 
-        // Ethernet header already in slot from prefillRing() — skip to payload
         auto* p = frame + kEthHdrLen;
         p[0] = PKT_FIRE;
         p[1] = 0;
-        std::memcpy(p + 2, &slot, 2);
+        std::memcpy(p + 2,  &info.eventId, 2);
+        std::memcpy(p + 4,  &sec,  4);
+        std::memcpy(p + 8,  &nsec, 4);
+        p[12] = info.channel;
+        p[13] = 0;
+        std::memcpy(p + 14, &info.offsetMs, 2);
+
+        m_ethernetSocket.commit();
+    }
+
+    [[gnu::always_inline]]
+    inline void sendCtimFire(std::uint16_t evId, std::uint32_t sec, std::uint32_t nsec) {
+        auto* frame = m_ethernetSocket.acquire(kFrameSize);
+        if (!frame) [[unlikely]] return;
+
+        auto* p = frame + kEthHdrLen;
+        p[0] = PKT_CTIM_FIRE;
+        p[1] = 0;
+        std::memcpy(p + 2, &evId, 2);
         std::memcpy(p + 4, &sec,  4);
         std::memcpy(p + 8, &nsec, 4);
 
@@ -138,8 +171,13 @@ private:
     std::array<std::uint8_t, kFrameSize> m_frameTemplate{};
 
     // ── Lookup tables ────────────────────────────────────────────
+    // Indexed by sw_cmp_idx (0..511). Populated by CONFIG capsule,
+    // read by PULSE capsule to stamp enriched metadata into wire packets.
     alignas(64) std::array<bool, kMaxComp>          m_compActive{};
-    std::array<std::uint16_t, kMaxComp>             m_compToSlot{};
+    std::array<CompEntry, kMaxComp>                 m_compInfo{};
+
+    // ── Action map (populated once at startup, read at CONFIG time) ──
+    std::vector<ActionInfo>                         m_actionMap;
 
     // ── Cold state ───────────────────────────────────────────────
     bool m_pcieConnectionResult{};

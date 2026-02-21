@@ -123,8 +123,11 @@ static void runTransmitter() {
         {138, 26},  // PI2X.F900-CT  → pulser 26
     });
 
-    std::printf("[TX] PCIe open, MAC set, %zu CTIMs configured. Entering poll loop.\n",
-                ctimConfig.configuredCount());
+    // Install action map so transmitter can enrich FIRE packets with metadata
+    transmitter.installActionMap(ctimConfig.actionMap());
+
+    std::printf("[TX] PCIe open, MAC set, %zu CTIMs configured, %zu actions mapped. Entering poll loop.\n",
+                ctimConfig.configuredCount(), ctimConfig.actionMap().size());
     transmitter.transmitAll(g_running);
     // Returns here when g_running goes false — destructors clean up PCIe + socket
     // ctimConfig destructor deletes mailbox actions/conditions before transmitter closes PCIe
