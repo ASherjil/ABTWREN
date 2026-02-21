@@ -42,6 +42,7 @@ target_link_options(abtwren_flags INTERFACE
 # ── WREN Transmitter library ─────────────────────────────────────
 add_library(wren_transmitter STATIC
     src/WRENTransmitter.cpp
+    src/WRENCTIMConfigurator.cpp
 )
 
 target_include_directories(wren_transmitter PUBLIC

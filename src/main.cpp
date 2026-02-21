@@ -9,6 +9,7 @@
 
 #include "WRENProtocol.hpp"
 #include "WRENTransmitter.hpp"
+#include "WRENCTIMConfigurator.hpp"
 #include "WRENReceiver.hpp"
 #include <NicTuner.hpp>
 
@@ -113,9 +114,20 @@ static void runTransmitter() {
     WRENTransmitter transmitter(WREN_VENDOR_ID, WREN_DEVICE_ID, WREN_BAR, tx_cfg);
     transmitter.setMacAddresses(kTxMac, kRxMac);  // src=mkdev30, dst=mkdev16
 
-    std::printf("[TX] PCIe open, MAC set, TX ring pre-filled. Entering poll loop.\n");
+    // Configure 0-offset CTIM fire actions via PCIe mailbox.
+    // Uses free pulser channels (9-19, 24-30 available; 1-8,20-23,31-32 in use).
+    // Destructor deletes actions+conditions from firmware on shutdown.
+    WRENCTIMConfigurator ctimConfig(transmitter.pcie(), {
+        {142, 24},  // PIX.AMCLO-CT  → pulser 24
+        {143, 25},  // PIX.F900-CT   → pulser 25
+        {138, 26},  // PI2X.F900-CT  → pulser 26
+    });
+
+    std::printf("[TX] PCIe open, MAC set, %zu CTIMs configured. Entering poll loop.\n",
+                ctimConfig.configuredCount());
     transmitter.transmitAll(g_running);
     // Returns here when g_running goes false — destructors clean up PCIe + socket
+    // ctimConfig destructor deletes mailbox actions/conditions before transmitter closes PCIe
 }
 
 // =============================================================================

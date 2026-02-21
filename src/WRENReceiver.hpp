@@ -8,6 +8,7 @@
 #include "WRENProtocol.hpp"
 #include <PacketMmapRx.hpp>
 
+#include <array>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -63,6 +64,7 @@ private:
     const auto* p = frame.data.data() + kEthHdrLen;
 
     if (p[0] == PKT_ADVANCE) {
+      /*
       std::uint16_t evId, slot;
       std::uint32_t sec, nsec;
       std::memcpy(&evId, p + 2,  2);
@@ -70,6 +72,7 @@ private:
       std::memcpy(&sec,  p + 6,  4);
       std::memcpy(&nsec, p + 10, 4);
       std::printf("ADVANCE  ev_id:%u  slot:%u  due:%u.%09u\n", evId, slot, sec, nsec);
+      */
     }
     else if (p[0] == PKT_FIRE) {
       std::uint16_t slot;
@@ -77,7 +80,19 @@ private:
       std::memcpy(&slot, p + 2, 2);
       std::memcpy(&sec,  p + 4, 4);
       std::memcpy(&nsec, p + 8, 4);
-      std::printf("FIRE     slot:%u  at:%u.%09u\n", slot, sec, nsec);
+
+      // Classify: is this a 0-offset CTIM fire or a regular LTIM fire?
+      // act_idx 2040+ are our mailbox-configured 0-offset actions (see WRENCTIMConfigurator)
+      // Order matches the target list passed to WRENCTIMConfigurator in main.cpp
+      constexpr std::uint16_t kCtimFireActBase = 2040;
+      constexpr std::array<std::uint16_t, 3> kCtimFireEvents = {142, 143, 138};
+
+      if (slot >= kCtimFireActBase && slot < kCtimFireActBase + kCtimFireEvents.size()) {
+        auto idx = static_cast<std::size_t>(slot - kCtimFireActBase);
+        std::printf("CTIM_FIRE  ev_id:%u  at:%u.%09u\n", kCtimFireEvents[idx], sec, nsec);
+      } else {
+        std::printf("LTIM_FIRE  slot:%u  at:%u.%09u\n", slot, sec, nsec);
+      }
     }
   }
 };

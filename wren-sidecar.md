@@ -223,6 +223,65 @@ immediately → `pulses_handler()` writes `CMD_ASYNC_PULSE` to async ring.
 WREN_NBR_PULSERS=32, WREN_NBR_COMPARATORS=256.
 Use high indices (cond 1100+, act 2040+) to avoid LTIM driver conflicts.
 
+## Configuration Approach: Direct Mailbox vs wrentest
+
+Two ways to configure the 0-offset CTIM fire actions on the WREN firmware:
+
+### Option 1: Direct PCIe Mailbox (chosen)
+
+Write CMD_RX_SUBSCRIBE / CMD_RX_SET_COND / CMD_RX_SET_ACTION directly to
+BAR1 mailbox registers from our sidecar process at startup.
+
+**Pros:**
+- We control act_idx (2040+) and cond_idx (1100+) — trivial CONFIG/PULSE mapping
+- No external process dependency
+- Sub-millisecond startup (3 commands × ~100µs each)
+
+**Cons:**
+- Must not overlap with kernel driver mailbox access (startup-only, safe in practice)
+- Bypasses driver mutex (OK because wrentest/kernel driver not running during sidecar init)
+
+### Option 2: wrentest ltim create (alternative)
+
+Shell out via `system("wrentest ltim create --event <evId> --channel 32 --load-offset 0 --int-enabled")`.
+Uses `WrenReceiver::createTrigger()` → kernel ioctl → firmware mailbox (properly serialized).
+
+**Pros:**
+- Serialized through kernel mutex — safe if other processes use the WREN
+- Well-tested code path (same as LTIM driver)
+
+**Cons:**
+- Driver auto-allocates `config_idx` (act_idx) — we can't predict what value CONFIG
+  capsules will report, making the sw_cmp_idx → act_idx → event_id mapping harder
+- Would need to parse `wrentest ltim list` output to discover assigned config_ids
+- Channel range 1-32 (1-indexed, maps to pulsers 0-31); channel 32 = pulser 31
+- External binary dependency; `--load-offset` is in milliseconds (0 = immediate fire)
+
+### Decision
+
+Direct mailbox chosen because the CONFIG/PULSE dispatch depends on knowing act_idx
+at compile time. With wrentest, the firmware assigns act_idx dynamically, requiring
+runtime discovery (parse `wrentest ltim list`) and a more complex mapping table.
+
+One LTIM per CTIM is required — firmware conditions match exactly one `evt_id`
+(line 836 of `wrenrx-cmd.c`: `cond->cond.evt_id = arg->cond.evt_id`). So 3 CTIMs = 3
+new conditions + 3 new actions, regardless of approach.
+
+### Upstream Stability (verified Feb 20, 2026)
+
+Checked 20 recent commits to both `wren-gw` and `timing-wrt` repos after `git pull`.
+**No changes** to any of the following:
+- `wren-mb-cmds.def` (command ID enum) — UNCHANGED
+- `mb_map.h` (mailbox memory layout) — UNCHANGED
+- `cmd_rx_subscribe`, `cmd_rx_set_cond`, `cmd_rx_set_action` handlers in `wrenrx-cmd.c`
+- `wren_mb_msg` handshake in `wren-core.c`
+- `exec_host_command` dispatch in `main.c`
+
+Changes found were all non-breaking: include renames (`wren-hw.h` → `mb.h`), evlog
+context header modifications, `wren_mb_hw_config` struct extensions, log read pin range
+fixes. Our mailbox command structs (`wren_mb_rx_subscribe`, `wren_mb_rx_set_cond`,
+`wren_mb_rx_set_action`, `wren_mb_pulser_config`) are untouched.
+
 ## Forwarding Strategy
 
 **Events arrive seconds in advance.** The `ts` field is the **due time** (future TAI time

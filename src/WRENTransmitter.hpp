@@ -17,7 +17,7 @@
 #include <utility>
 
 constexpr int kMaxSlots = 64;
-constexpr int kMaxComp  = 256;
+constexpr int kMaxComp  = 512;
 
 struct LtimTarget {
     std::uint16_t event_id;
@@ -46,6 +46,9 @@ public:
     WRENTransmitter& operator=(WRENTransmitter&&) noexcept = default;
 
     ~WRENTransmitter() = default;
+
+    /// Access the PCIeBackend for shared use (e.g., WRENCTIMConfigurator).
+    [[nodiscard]] PCIeBackend& pcie() { return m_pcieHandler; }
 
     // Ethernet frame layout: [dst:0-5][src:6-11][ethertype:12-13][payload:14+]
     void setMacAddresses(const std::array<std::uint8_t, 6>& src, const std::array<std::uint8_t, 6>& dst);
@@ -121,130 +124,7 @@ public:
     //
     // Polls until 'running' goes false (set by watchdog / SIGINT).
     // Checks the flag every 65536 idle spins (~65ms) — zero overhead on hot path.
-
-    void transmitAll(const volatile std::sig_atomic_t& running) {
-        // Sync shadow pointer to current firmware position
-        m_shadowOff = *m_pcieHandler.registerPtr<std::uint32_t>(WREN_ASYNC_BOARD_OFF);
-        std::uint32_t spins = 0;
-
-        while (running) {
-            // ── Gate: 1 PCIe read (~1.0us) ───────────────────────
-            std::uint32_t boardOff =
-                *m_pcieHandler.registerPtr<std::uint32_t>(WREN_ASYNC_BOARD_OFF);
-
-            if (boardOff == m_shadowOff) [[likely]] {
-                if ((++spins & 0xFFFF) == 0 && !running) break;
-                continue;
-            }
-            spins = 0;
-
-            // ── Drain all new capsules ───────────────────────────
-            do {
-                // Can all 4 words be read as 2x 64-bit without wrapping?
-                bool safe64 = (m_shadowOff + 3) <= RING_MASK;
-
-                std::uint32_t hdr, w1;
-
-                if (safe64) [[likely]] {
-                    // 1 PCIe transaction: header + w1
-                    std::uint64_t hdrW1 = *m_pcieHandler.registerPtr<std::uint64_t>(
-                        WREN_ASYNC_DATA_BASE + m_shadowOff * 4);
-                    hdr = static_cast<std::uint32_t>(hdrW1);
-                    w1  = static_cast<std::uint32_t>(hdrW1 >> 32);
-                } else {
-                    // Ring wrap boundary — 2 individual 32-bit reads
-                    hdr = readRingWord(m_shadowOff);
-                    w1  = readRingWord(m_shadowOff + 1);
-                }
-
-                auto typ = static_cast<std::uint8_t>(hdr & TYP_MASK);
-                auto len = static_cast<std::uint16_t>(hdr >> LEN_SHIFT);
-
-                // Guard against corrupted ring (prevents infinite loop)
-                if (len == 0) [[unlikely]] {
-                    m_shadowOff = (m_shadowOff + 1) & RING_MASK;
-                    continue;
-                }
-
-                switch (typ) {
-
-                // ── FIRE path (latency-critical) ─────────────────
-                case TYP_PULSE: {
-                    auto comp = static_cast<std::uint16_t>(w1);
-                    if (!m_compActive[comp]) {
-                        break;
-                    }
-
-                    std::uint32_t sec, nsec;
-                    if (safe64) [[likely]] {
-                        std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
-                            WREN_ASYNC_DATA_BASE + (m_shadowOff + 2) * 4);
-                        sec  = static_cast<std::uint32_t>(w2w3);        // pulse: w2=sec
-                        nsec = static_cast<std::uint32_t>(w2w3 >> 32);  // pulse: w3=nsec
-                    } else {
-                        sec  = readRingWord(m_shadowOff + 2);
-                        nsec = readRingWord(m_shadowOff + 3);
-                    }
-                    sendFire(m_compToSlot[comp], sec, nsec);
-                    break;
-                }
-
-                // ── CONFIG: track comp_idx <-> ltim_slot mapping ─
-                case TYP_CONFIG: {
-                    auto comp = static_cast<std::uint16_t>(w1);
-                    auto slot = static_cast<std::uint16_t>(w1 >> 16);
-                    m_compToSlot[comp] = slot;
-
-                    // Activate if this slot is in our target set
-                    for (const auto& t : kTargets) {
-                        if (t.ltim_slot == slot) {
-                            m_compActive[comp] = true;
-                            break;
-                        }
-                    }
-                    break;
-                }
-
-                // ── ADVANCE path (relaxed — seconds early) ───────
-                case TYP_EVENT: {
-                    auto evId = static_cast<std::uint16_t>(w1);
-                    auto [targets, count] = resolveCtimToSlots(evId);
-                    if (count == 0) break;  // CTIM we don't care about
-
-                    // Read timestamp once (event: w2=nsec, w3=sec)
-                    std::uint32_t nsec, sec;
-                    if (safe64) [[likely]] {
-                        std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
-                            WREN_ASYNC_DATA_BASE + (m_shadowOff + 2) * 4);
-                        nsec = static_cast<std::uint32_t>(w2w3);
-                        sec  = static_cast<std::uint32_t>(w2w3 >> 32);
-                    } else {
-                        nsec = readRingWord(m_shadowOff + 2);
-                        sec  = readRingWord(m_shadowOff + 3);
-                    }
-
-                    for (int i = 0; i < count; ++i)
-                        sendAdvance(evId, targets[i].ltim_slot, sec, nsec);
-                    break;
-                }
-
-                // ── New cycle: comp_idx rotates, reset armed state
-                case TYP_CONTEXT:
-                    m_compActive.fill(false);
-                    break;
-
-                default:
-                    break;
-                }
-
-                m_shadowOff = (m_shadowOff + len) & RING_MASK;
-
-            } while (m_shadowOff != boardOff);
-        }
-        std::fprintf(stderr, "[TX] Exiting poll loop.\n");
-    }
-
-
+    void transmitAll(const volatile std::sig_atomic_t& running);
 private:
     void performRegisterDump() const;
 

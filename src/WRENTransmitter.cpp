@@ -97,3 +97,122 @@ void WRENTransmitter::setMacAddresses(const std::array<std::uint8_t, 6>& src, co
   // The kernel never modifies slot data on recycle — only tp_status.
   m_ethernetSocket.prefillRing(m_frameTemplate);
 }
+
+void WRENTransmitter::transmitAll(const volatile std::sig_atomic_t& running) {
+    // Sync shadow pointer to current firmware position
+    m_shadowOff = *m_pcieHandler.registerPtr<std::uint32_t>(WREN_ASYNC_BOARD_OFF);
+    std::uint32_t spins = 0;
+
+    while (running) {
+        // ── Gate: 1 PCIe read (~1.0us) ───────────────────────
+        std::uint32_t boardOff =
+            *m_pcieHandler.registerPtr<std::uint32_t>(WREN_ASYNC_BOARD_OFF);
+
+        if (boardOff == m_shadowOff) [[likely]] {
+            if ((++spins & 0xFFFF) == 0 && !running) break;
+            continue;
+        }
+        spins = 0;
+
+        // ── Drain all new capsules ───────────────────────────
+        do {
+            // Can all 4 words be read as 2x 64-bit without wrapping?
+            bool safe64 = (m_shadowOff + 3) <= RING_MASK;
+
+            std::uint32_t hdr, w1;
+
+            if (safe64) [[likely]] {
+                // 1 PCIe transaction: header + w1
+                std::uint64_t hdrW1 = *m_pcieHandler.registerPtr<std::uint64_t>(
+                    WREN_ASYNC_DATA_BASE + m_shadowOff * 4);
+                hdr = static_cast<std::uint32_t>(hdrW1);
+                w1  = static_cast<std::uint32_t>(hdrW1 >> 32);
+            } else {
+                // Ring wrap boundary — 2 individual 32-bit reads
+                hdr = readRingWord(m_shadowOff);
+                w1  = readRingWord(m_shadowOff + 1);
+            }
+
+            auto typ = static_cast<std::uint8_t>(hdr & TYP_MASK);
+            auto len = static_cast<std::uint16_t>(hdr >> LEN_SHIFT);
+
+            // Guard against corrupted ring (prevents infinite loop)
+            if (len == 0) [[unlikely]] {
+                m_shadowOff = (m_shadowOff + 1) & RING_MASK;
+                continue;
+            }
+
+            switch (typ) {
+
+            // ── FIRE path (latency-critical) ─────────────────
+            case TYP_PULSE: {
+                auto comp = static_cast<std::uint16_t>(w1);
+                if (!m_compActive[comp]) {
+                    break;
+                }
+
+                std::uint32_t sec, nsec;
+                if (safe64) [[likely]] {
+                    std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
+                        WREN_ASYNC_DATA_BASE + (m_shadowOff + 2) * 4);
+                    sec  = static_cast<std::uint32_t>(w2w3);        // pulse: w2=sec
+                    nsec = static_cast<std::uint32_t>(w2w3 >> 32);  // pulse: w3=nsec
+                } else {
+                    sec  = readRingWord(m_shadowOff + 2);
+                    nsec = readRingWord(m_shadowOff + 3);
+                }
+                sendFire(m_compToSlot[comp], sec, nsec);
+                break;
+            }
+
+            // ── CONFIG: track sw_cmp <-> act_idx mapping ──────
+            // Activate unconditionally — transmitter forwards ALL fires.
+            // Classification (CTIM vs LTIM, channel mapping) belongs on consumer side.
+            case TYP_CONFIG: {
+                const auto actIdx = static_cast<std::uint16_t>(w1);
+                const auto swCmp  = static_cast<std::uint16_t>(w1 >> 16);
+                m_compToSlot[swCmp] = actIdx;
+                m_compActive[swCmp] = true;
+                break;
+            }
+
+            // ── ADVANCE path (relaxed — seconds early) ───────
+            case TYP_EVENT: {
+                auto evId = static_cast<std::uint16_t>(w1);
+                auto [targets, count] = resolveCtimToSlots(evId);
+                if (count == 0) break;  // CTIM we don't care about
+
+                // Read timestamp once (event: w2=nsec, w3=sec)
+                std::uint32_t nsec, sec;
+                if (safe64) [[likely]] {
+                    std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
+                        WREN_ASYNC_DATA_BASE + (m_shadowOff + 2) * 4);
+                    nsec = static_cast<std::uint32_t>(w2w3);
+                    sec  = static_cast<std::uint32_t>(w2w3 >> 32);
+                } else {
+                    nsec = readRingWord(m_shadowOff + 2);
+                    sec  = readRingWord(m_shadowOff + 3);
+                }
+
+                for (int i = 0; i < count; ++i)
+                    sendAdvance(evId, targets[i].ltim_slot, sec, nsec);
+                break;
+            }
+
+            // CONTEXT: informational (new timing context). Do NOT clear
+            // m_compActive — firmware reuses sw_cmp from a pool and CONFIG
+            // always updates m_compToSlot before the corresponding PULSE fires.
+            // Clearing here would drop PULSEs with long offsets (e.g. 900ms).
+            case TYP_CONTEXT:
+                break;
+
+            default:
+                break;
+            }
+
+            m_shadowOff = (m_shadowOff + len) & RING_MASK;
+
+        } while (m_shadowOff != boardOff);
+    }
+    std::fprintf(stderr, "[TX] Exiting poll loop.\n");
+}
