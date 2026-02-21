@@ -16,10 +16,10 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
-#include <vector>
 
-constexpr int kMaxSlots = 64;
-constexpr int kMaxComp  = 512;
+constexpr int kMaxSlots  = 64;
+constexpr int kMaxComp   = 512;
+constexpr int kMaxActIdx = 2048;  // firmware MAX_RX_ACTIONS (covers CTIM entries at 2040+)
 
 /// Metadata cached per sw_cmp_idx. Populated at CONFIG time from the action map,
 /// read at PULSE time to stamp enriched data into the wire packet.
@@ -61,10 +61,18 @@ public:
     /// Access the PCIeBackend for shared use (e.g., WRENCTIMConfigurator).
     [[nodiscard]] PCIeBackend& pcie() { return m_pcieHandler; }
 
-    /// Install the discovered action map (act_idx → eventId/channel/offset).
-    /// Called once at startup before transmitAll(). The transmitter uses this
-    /// at CONFIG time to populate m_compInfo[] for zero-cost PULSE enrichment.
-    void installActionMap(const std::vector<ActionInfo>& map) { m_actionMap = map; }
+    /// Install the discovered action map into a flat array indexed by act_idx.
+    /// Called once at startup before transmitAll(). CONFIG handler then does
+    /// a single array copy: m_compInfo[swCmp] = m_actMeta[actIdx].
+    void installActionMap(const std::vector<ActionInfo>& map) {
+        for (const auto& a : map) {
+            if (a.actIdx < kMaxActIdx) {
+                m_actMeta[a.actIdx].eventId  = a.eventId;
+                m_actMeta[a.actIdx].channel  = a.channel;
+                m_actMeta[a.actIdx].offsetMs = static_cast<std::uint16_t>(a.offsetNs / 1'000'000);
+            }
+        }
+    }
 
     // Ethernet frame layout: [dst:0-5][src:6-11][ethertype:12-13][payload:14+]
     void setMacAddresses(const std::array<std::uint8_t, 6>& src, const std::array<std::uint8_t, 6>& dst);
@@ -161,8 +169,10 @@ private:
     alignas(64) std::array<bool, kMaxComp>          m_compActive{};
     std::array<CompEntry, kMaxComp>                 m_compInfo{};
 
-    // ── Action map (populated once at startup, read at CONFIG time) ──
-    std::vector<ActionInfo>                         m_actionMap;
+    // ── Action metadata (flat array, O(1) lookup by act_idx) ────────
+    // Populated once at startup by installActionMap(). CONFIG handler
+    // copies: m_compInfo[swCmp] = m_actMeta[actIdx]. ~12KB, fits in L2.
+    std::array<CompEntry, kMaxActIdx>               m_actMeta{};
 
     // ── Cold state ───────────────────────────────────────────────
     bool m_pcieConnectionResult{};

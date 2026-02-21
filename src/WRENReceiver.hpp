@@ -39,7 +39,7 @@ public:
           // TODO: take the frame.data and push into the SPSC queue
           printDebugLogs(frame);
 
-          m_ethernetSocket.release(); // VERY IMPORTANT, you must release after processing the data 
+          m_ethernetSocket.release(); // VERY IMPORTANT, you must release after processing the data
         }
         spins = 0;
         continue;

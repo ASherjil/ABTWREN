@@ -165,23 +165,12 @@ void WRENTransmitter::transmitAll(const volatile std::sig_atomic_t& running) {
             }
 
             // ── CONFIG: enrich sw_cmp with action metadata ────
-            // Look up act_idx in the action map to get eventId/channel/offset.
-            // This is NOT on the hot path (CONFIG arrives once per comparator load,
-            // well before the corresponding PULSE). Linear scan of ~20 entries is fine.
+            // O(1) flat array lookup — single copy from m_actMeta[actIdx].
+            // Unknown act_idx keeps sentinel defaults (evId=0, ch=0xFF, off=0xFFFF).
             case TYP_CONFIG: {
                 const auto actIdx = static_cast<std::uint16_t>(w1);
                 const auto swCmp  = static_cast<std::uint16_t>(w1 >> 16);
-
-                CompEntry entry{};
-                for (const auto& a : m_actionMap) {
-                    if (a.actIdx == actIdx) {
-                        entry.eventId  = a.eventId;
-                        entry.channel  = a.channel;
-                        entry.offsetMs = static_cast<std::uint16_t>(a.offsetNs / 1'000'000);
-                        break;
-                    }
-                }
-                m_compInfo[swCmp] = entry;
+                m_compInfo[swCmp] = m_actMeta[actIdx];
                 m_compActive[swCmp] = true;
                 break;
             }
