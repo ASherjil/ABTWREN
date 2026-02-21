@@ -160,11 +160,7 @@ void WRENTransmitter::transmitAll(const volatile std::sig_atomic_t& running) {
                     nsec = readRingWord(m_shadowOff + 3);
                 }
 
-                const auto& info = m_compInfo[comp];
-                if (info.isCtim)
-                    sendCtimFire(info.eventId, sec, nsec);
-                else
-                    sendFire(info, sec, nsec);
+                sendFire(m_compInfo[comp], sec, nsec);
                 break;
             }
 
@@ -181,7 +177,6 @@ void WRENTransmitter::transmitAll(const volatile std::sig_atomic_t& running) {
                     if (a.actIdx == actIdx) {
                         entry.eventId  = a.eventId;
                         entry.channel  = a.channel;
-                        entry.isCtim   = (a.offsetNs == 0);
                         entry.offsetMs = static_cast<std::uint16_t>(a.offsetNs / 1'000'000);
                         break;
                     }

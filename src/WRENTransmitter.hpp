@@ -23,11 +23,11 @@ constexpr int kMaxComp  = 512;
 
 /// Metadata cached per sw_cmp_idx. Populated at CONFIG time from the action map,
 /// read at PULSE time to stamp enriched data into the wire packet.
+/// Defaults are sentinels: channel=0xFF, offsetMs=0xFFFF → "unresolved / CTIM fire".
 struct CompEntry {
     std::uint16_t eventId{};
-    std::uint8_t  channel{};    // 1-based wrentest channel (0 = unknown)
-    bool          isCtim{};     // true for 0-offset CTIM fire actions
-    std::uint16_t offsetMs{};   // delay from CTIM time in ms (0 for CTIM fires)
+    std::uint8_t  channel{0xFF};     // 1-based wrentest channel (0xFF = no channel)
+    std::uint16_t offsetMs{0xFFFF};  // delay in ms (0xFFFF = no offset / CTIM)
 };
 
 struct LtimTarget {
@@ -99,8 +99,8 @@ public:
     // Hot path only overwrites the payload bytes that change.
     //
     // Payload layouts (at frame + 14):
-    //   ADVANCE: [type:1][0:1][evId:2][slot:2][sec:4][nsec:4]  (14 bytes)
-    //   FIRE:    [type:1][0:1][slot:2][sec:4][nsec:4]          (12 bytes)
+    //   ADVANCE: [type:1][0:1][evId:2][slot:2][sec:4][nsec:4]                 (14 bytes)
+    //   FIRE:    [type:1][0:1][evId:2][sec:4][nsec:4][ch:1][0:1][offsetMs:2] (16 bytes)
 
     [[gnu::always_inline]]
     inline void sendAdvance(std::uint16_t evId, std::uint16_t slot,
@@ -134,21 +134,6 @@ public:
         p[12] = info.channel;
         p[13] = 0;
         std::memcpy(p + 14, &info.offsetMs, 2);
-
-        m_ethernetSocket.commit();
-    }
-
-    [[gnu::always_inline]]
-    inline void sendCtimFire(std::uint16_t evId, std::uint32_t sec, std::uint32_t nsec) {
-        auto* frame = m_ethernetSocket.acquire(kFrameSize);
-        if (!frame) [[unlikely]] return;
-
-        auto* p = frame + kEthHdrLen;
-        p[0] = PKT_CTIM_FIRE;
-        p[1] = 0;
-        std::memcpy(p + 2, &evId, 2);
-        std::memcpy(p + 4, &sec,  4);
-        std::memcpy(p + 8, &nsec, 4);
 
         m_ethernetSocket.commit();
     }

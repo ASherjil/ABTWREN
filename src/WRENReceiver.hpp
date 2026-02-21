@@ -32,14 +32,14 @@ public:
     std::uint32_t spins = 0;
 
     while (running) {
-      RxFrame frame = m_ethernetSocket.tryReceive();
+      RxFrame frame = m_ethernetSocket.tryReceive(); // receive from the kernel
 
       if (!frame.data.empty()){
         if (frame.data.size() >= kFrameSize) [[likely]] {
           // TODO: take the frame.data and push into the SPSC queue
           printDebugLogs(frame);
 
-          m_ethernetSocket.release();
+          m_ethernetSocket.release(); // VERY IMPORTANT, you must release after processing the data 
         }
         spins = 0;
         continue;
@@ -82,16 +82,13 @@ private:
       std::memcpy(&nsec,     p + 8,  4);
       auto ch = p[12];
       std::memcpy(&offsetMs, p + 14, 2);
-      std::printf("LTIM_FIRE  ev_id:%u  ch:%u  +%ums  at:%u.%09u\n",
-                  evId, ch, offsetMs, sec, nsec);
-    }
-    else if (p[0] == PKT_CTIM_FIRE) {
-      std::uint16_t evId;
-      std::uint32_t sec, nsec;
-      std::memcpy(&evId, p + 2, 2);
-      std::memcpy(&sec,  p + 4, 4);
-      std::memcpy(&nsec, p + 8, 4);
-      std::printf("CTIM_FIRE  ev_id:%u  at:%u.%09u\n", evId, sec, nsec);
+
+      // Sentinels (ch=0xFF, offsetMs=0xFFFF) → CTIM fire, otherwise LTIM fire
+      if (ch == 0xFF)
+        std::printf("CTIM_FIRE  ev_id:%u  at:%u.%09u\n", evId, sec, nsec);
+      else
+        std::printf("LTIM_FIRE  ev_id:%u  ch:%u  +%ums  at:%u.%09u\n",
+                    evId, ch, offsetMs, sec, nsec);
     }
   }
 };

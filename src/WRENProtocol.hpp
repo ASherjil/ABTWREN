@@ -46,15 +46,15 @@ constexpr std::uint32_t RING_MASK   = 2047;
 //
 // Ethernet frame: [dst:6][src:6][ethertype:2][payload] = 64 bytes minimum
 // Payload layouts (at byte 14):
-//   ADVANCE:    [type:1][0:1][evId:2][slot:2][sec:4][nsec:4]                 (14 bytes)
-//   FIRE:       [type:1][0:1][evId:2][sec:4][nsec:4][ch:1][0:1][offsetMs:2] (16 bytes)
-//   CTIM_FIRE:  [type:1][0:1][evId:2][sec:4][nsec:4]                        (12 bytes)
+//   ADVANCE: [type:1][0:1][evId:2][slot:2][sec:4][nsec:4]                 (14 bytes)
+//   FIRE:    [type:1][0:1][evId:2][sec:4][nsec:4][ch:1][0:1][offsetMs:2] (16 bytes)
+//            ch=0xFF + offsetMs=0xFFFF → CTIM fire (no physical output)
 
 constexpr std::size_t   kMacLength  = 6;
 constexpr std::size_t   kEthHdrLen  = 14;    // dst(6) + src(6) + ethertype(2)
 constexpr std::uint32_t kFrameSize  = 64;    // Minimum Ethernet frame — always send full size
 constexpr std::uint16_t kEtherType  = 0x88B5; // IEEE local experimental
 
-enum PktType : std::uint8_t { PKT_ADVANCE = 1, PKT_FIRE = 2, PKT_CTIM_FIRE = 3 };
+enum PktType : std::uint8_t { PKT_ADVANCE = 1, PKT_FIRE = 2 };
 
 #endif // ABTWREN_WRENPROTOCOL_HPP

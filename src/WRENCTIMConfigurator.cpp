@@ -141,13 +141,15 @@ void WRENCTIMConfigurator::discoverActions() {
                     idx, eventId, channel, static_cast<long long>(offsetNs / 1'000'000));
     }
 
-    // Add our own CTIM fire actions (act_idx 2040+ not found by 0..255 scan)
+    // Add our own CTIM fire actions (act_idx 2040+ not found by 0..255 scan).
+    // Use sentinel values (channel=0xFF, offsetNs maps to offsetMs=0xFFFF) so the
+    // receiver can distinguish CTIM fires from LTIM fires without any TX-side logic.
     for (std::size_t i = 0; i < m_targets.size(); ++i) {
         m_actionMap.push_back({
             static_cast<std::uint16_t>(kCtimActBase + i),
             m_targets[i].eventId,
-            static_cast<std::uint8_t>(m_targets[i].pulserIdx + 1),
-            0  // 0-offset = CTIM fire
+            0xFF,                                       // sentinel: no physical channel
+            static_cast<std::int64_t>(0xFFFF) * 1'000'000  // → offsetMs = 0xFFFF after /1e6
         });
     }
 
