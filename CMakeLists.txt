@@ -16,13 +16,20 @@ FetchContent_Declare(
     GIT_TAG        master
 )
 
-FetchContent_MakeAvailable(ABTEdge ABTRDA3)
+FetchContent_Declare(
+    SPSCQueue
+    GIT_REPOSITORY https://github.com/rigtorp/SPSCQueue.git
+    GIT_TAG        master
+)
+
+FetchContent_MakeAvailable(ABTEdge ABTRDA3 SPSCQueue)
 
 # ── Compiler flags ────────────────────────────────────────────────
 add_library(abtwren_flags INTERFACE)
 target_compile_features(abtwren_flags INTERFACE cxx_std_20)
 target_compile_options(abtwren_flags INTERFACE
     -Wall -Wextra -Wpedantic -Werror=return-type -Wconversion -Wshadow
+    -Wno-interference-size   # suppress GCC warning from rigtorp/SPSCQueue.h
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
@@ -57,6 +64,8 @@ target_link_libraries(wren_transmitter
 # ── WREN Receiver library ───────────────────────────────────────
 add_library(wren_receiver STATIC
     src/WRENReceiver.cpp
+    src/EventProcessor.cpp
+    src/MainReceiver.cpp
 )
 
 target_include_directories(wren_receiver PUBLIC
@@ -64,7 +73,7 @@ target_include_directories(wren_receiver PUBLIC
 )
 
 target_link_libraries(wren_receiver
-    PUBLIC  abtrda3
+    PUBLIC  abtrda3 SPSCQueue
     PRIVATE abtwren_flags
 )
 

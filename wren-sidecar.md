@@ -101,15 +101,26 @@ word 0: header        { typ=0x03, source_idx, len=2 }
 word 1: identifiers   { act_idx[15:0], sw_cmp_idx[31:16] }
 ```
 
-- `act_idx`: firmware action index (same as LTIM slot number from `wrentest ltim list`)
-- `sw_cmp_idx`: software comparator index (allocated by firmware, 0-511)
+- `act_idx`: firmware action index (NOT the same as wrentest channel number — see discovery below)
+- `sw_cmp_idx`: software comparator index (allocated by firmware from a pool, 0-511)
 - Written by firmware `async_send_config()` when a hardware comparator is loaded
 - Maps act_idx → sw_cmp_idx; PULSE capsule later reports sw_cmp_idx when it fires
 
-**Critical bug found (Feb 2026):** Our code confused act_idx with sw_cmp_idx.
-CONFIG gives `[act_idx:16][sw_cmp_idx:16]`, PULSE gives `sw_cmp_idx`.
-The correct reverse mapping: CONFIG populates `m_swCmpInfo[sw_cmp_idx]` with act_idx,
-then PULSE looks up `m_swCmpInfo[sw_cmp_idx]` to dispatch.
+**Critical bugs found (Feb 2026):**
+1. Our code confused act_idx with sw_cmp_idx and wrentest channel numbers. These are
+   three distinct things: act_idx is firmware-allocated (0, 1, 2, 12, 13, 15 for our LTIMs),
+   wrentest channel = `pulser_idx + 1` (1-based display), sw_cmp_idx = comparator pool index.
+2. CONFIG handler originally matched only specific act_idx values. Fixed to activate ALL
+   configs unconditionally — transmitter forwards everything, receiver classifies.
+3. The CONTEXT capsule handler originally called `m_compActive.fill(false)`, clearing all
+   active comparators between events. This dropped PULSEs with long offsets (e.g., 900ms).
+   Fixed by removing the fill — CONFIG always updates m_compInfo before PULSE fires.
+
+**Current implementation:** CONFIG handler does a single O(1) array copy:
+```cpp
+m_compInfo[swCmp] = m_actMeta[actIdx];  // flat array, pre-populated at startup
+m_compActive[swCmp] = true;
+```
 
 ## Event ID Examples (from timing-domain-cern)
 
@@ -198,9 +209,13 @@ Used to configure conditions and actions at startup (not on hot path).
 6. Write 0 to B2H_CSR to acknowledge
 
 **Key Command IDs** (from `wren-mb-cmds.def` enum):
-- `CMD_RX_SUBSCRIBE` = 38: subscribe to event ID on source/domain
 - `CMD_RX_SET_COND` = 18: create condition matching event ID
+- `CMD_RX_DEL_COND` = 19: delete condition
+- `CMD_RX_GET_COND` = 20: query condition (returns 11-word `struct wren_rx_cond`)
 - `CMD_RX_SET_ACTION` = 21: create action with pulser config + time offset
+- `CMD_RX_DEL_ACTION` = 22: delete action
+- `CMD_RX_GET_ACTION` = 24: query action (returns 8-word `struct wren_rx_action`)
+- `CMD_RX_SUBSCRIBE` = 38: subscribe to event ID on source/domain
 
 **Safety:** Only send during startup. Firmware is single-threaded. Avoid concurrent
 mailbox access with kernel driver or wrentest. PCIe write ordering guarantees visibility.
@@ -215,13 +230,96 @@ To get CTIM fire at exact time T (not just ADVANCE seconds early):
 Firmware computes `due_time = event_ts + 0`, loads hardware comparator, which fires
 immediately → `pulses_handler()` writes `CMD_ASYNC_PULSE` to async ring.
 
-**Pulser config:**
-- pulser_idx=31 (dedicated, unused by LTIMs), flags=0x84 (INT_EN|ENABLE)
-- width/period/npulses/idelay: 0, load_off_sec/nsec: 0
+**Current CTIM targets (from main.cpp):**
+```cpp
+WRENCTIMConfigurator ctimConfig(transmitter.pcie(), {
+    {142, 24},  // PIX.AMCLO-CT  → pulser 24 (wrentest channel 25)
+    {143, 25},  // PIX.F900-CT   → pulser 25 (wrentest channel 26)
+    {138, 26},  // PI2X.F900-CT  → pulser 26 (wrentest channel 27)
+});
+```
+
+**Pulser config (per action):**
+- flags=0x84 (INT_EN | ENABLE)
+- inputs: clock=1kHz, start=NOSTART(31), stop=NOSTOP(31)
+- width=1000, period=1, npulses=1, idelay=0
+- load_off_sec=0, load_off_nsec=0
+
+**Index allocation (high range, avoids LTIM driver conflicts):**
+- Condition indices: 1100, 1101, 1102 (`kCtimCondBase = 1100`)
+- Action indices: 2040, 2041, 2042 (`kCtimActBase = 2040`)
+- Source index: 0 (primary WR timing domain)
 
 **Firmware limits:** MAX_RX_CONDS=1152, MAX_RX_ACTIONS=2048, NBR_SW_COMP=512,
 WREN_NBR_PULSERS=32, WREN_NBR_COMPARATORS=256.
-Use high indices (cond 1100+, act 2040+) to avoid LTIM driver conflicts.
+
+**Lifecycle:** `WRENCTIMConfigurator` constructor calls setupAll() (subscribe + set_cond +
+set_action for each CTIM) and discoverActions(). Destructor calls cleanupAll() (del_action
+then del_cond for each). Order matters: actions reference conditions.
+
+## Firmware Action Discovery (CMD_RX_GET_ACTION + CMD_RX_GET_COND)
+
+At startup, `WRENCTIMConfigurator::discoverActions()` scans act_idx 0..255 to build a
+lookup table mapping `act_idx → {eventId, channel, offsetMs}`. This lets the transmitter
+enrich FIRE packets with human-readable metadata (which CTIM triggered, which channel,
+what offset) without any hot-path computation.
+
+### GET_ACTION Reply Layout (`struct wren_rx_action`, 8 words LE)
+```
+word 0: [next:16 low][cond_idx:16 high]
+word 1: [pulser_idx:8][flags:8][inputs:16 high]
+word 2: width
+word 3: period
+word 4: npulses
+word 5: idelay          ← delay in clock ticks
+word 6: load_off_sec
+word 7: load_off_nsec
+```
+
+### GET_COND Reply Layout (`struct wren_rx_cond`, 11 words LE)
+```
+word 0: [next:16 low][act_idx:16 high]        (prefix from wren_rx_cond)
+word 1: [nbr_act:8][log:8][nparam:16 high]    (prefix)
+word 2: [evt_id:16 low][src_idx:8][len:8]     ← event ID here
+words 3..10: condition ops (matching parameters)
+```
+
+**Important:** GET_COND returns `struct wren_rx_cond` (11 words), NOT `struct wren_mb_cond`
+(9 words). The 2-word prefix shifts all field positions. evt_id is at word 2, not word 0.
+
+### Offset Computation
+Actual delay = `idelay / clock_frequency`. Clock source from `inputs` bits [14:10]:
+- 23 → 1 kHz (1ms/tick): `offsetNs = idelay * 1'000'000`
+- 25 → 10 MHz (100ns/tick): `offsetNs = idelay * 100`
+- 31 → 1 GHz (1ns/tick): `offsetNs = idelay * 1`
+
+### Channel Mapping
+- Firmware stores 0-based `pulser_idx`
+- wrentest displays 1-based channel: `channel = pulser_idx + 1`
+- `load_off_sec/nsec` are 0 for all existing LTIMs — delay comes from `idelay` field
+
+### Verified Example (from hex dumps, Feb 21 2026)
+```
+act[0] raw: 0000FFFF 5FFF8C16 000003E8 00000001 00000001 00000032 00000000 00000000
+cond[0] raw: 0000FFFF 00000001 0000008E DEADBEEF ...
+```
+- cond_idx = word0 >> 16 = 0 ✓
+- pulser_idx = word1 & 0xFF = 0x16 = 22, channel = 23 ✓ (wrentest shows ch23)
+- flags = (word1 >> 8) & 0xFF = 0x8C ✓ (INT_EN | ENABLE | more)
+- idelay = word5 = 0x32 = 50, clock = 1kHz → 50ms ✓
+- evt_id = condReply[2] & 0xFFFF = 0x8E = 142 ✓ (PIX.AMCLO-CT)
+
+### Discovery Output (16 LTIM + 3 CTIM actions)
+```
+act[0]  → ev_id:142  ch:23  offset:50ms
+act[1]  → ev_id:138  ch:22  offset:900ms
+act[2]  → ev_id:143  ch:22  offset:900ms
+act[12] → ev_id:143  ch:20  offset:10ms
+act[13] → ev_id:143  ch:21  offset:100ms
+act[15] → ev_id:138  ch:21  offset:100ms
+(+ entries with ev_id:0 from external CPS triggers on other channels)
+(+ 3 CTIM fire entries at act_idx 2040-2042 with ch=0xFF, offset=0xFFFF sentinels)
+```
 
 ## Configuration Approach: Direct Mailbox vs wrentest
 
@@ -409,26 +507,56 @@ is caused by SMI (System Management Interrupts) which cannot be avoided in softw
 ## Clock Synchronization Analysis
 
 ### The Problem
-The WREN board's clock is synchronized via White Rabbit to sub-nanosecond precision.
-Slave FECs without timing hardware rely on NTP, which introduces clock uncertainty.
-If the slave fires events based on its own clock, clock sync error = execution jitter.
+The WREN board's clock is synchronized via White Rabbit to sub-nanosecond precision,
+but this clock lives entirely on the WREN PCIe card (BAR1 registers TM_TAI_LO/HI/CYCLES).
+**Neither FEC's system clock is WR-synced.** Both mkdev30 (TX) and mkdev16 (RX) use NTP
+via chrony to CERN's NTP infrastructure. The WR timestamps in FIRE packets come from the
+WREN card's ring buffer, not from the host's `clock_gettime()`.
 
-### Measured Clock Sync on Test Hardware
+### Measured Clock Sync (verified Feb 21 2026 via SSH)
+
+**Both machines sync to the same CERN NTP servers:**
+
+| Machine | chrony source | Stratum | System offset | RMS offset |
+|---------|---------------|---------|---------------|------------|
+| mkdev30 (TX) | ip-time-1.cern.ch | 3 | ~20µs | ~34µs |
+| mkdev16 (RX) | ip-time-1.cern.ch | 3 | ~6µs | ~27µs |
+
+chrony.conf servers: `ip-time-{0..5}.cern.ch iburst` (identical on both)
 
 **cfc-865-mkdev16 (x86, i5-8500, Siemens FEC):**
 
 | Method | Accuracy | Status |
 |--------|----------|--------|
-| NTP software timestamps (current) | ~18µs RMS | Running now |
+| NTP software timestamps (current) | ~27µs RMS | Running now |
 | NTP + HW timestamps (`hwtimestamp *`) | ~1-3µs | One line uncomment in chrony.conf |
-| Self-contained PTP (our two machines) | <1µs relative | We can do this ourselves (sudo) |
-| CERN PTP grandmaster | ~100-500ns | Not available on our VLAN, would need IT |
+| Self-contained PTP (our two machines) | <1µs relative | Feasible (see below) |
+| CERN PTP grandmaster | ~100-500ns | Would need timing team request |
 
-- NICs: Intel I219-LM (eno1) + 2x Intel I210 (eno2, eno3) — all support PTP HW timestamping
+- NICs: Intel I210 (`igb` driver, fw 3.25) — full PTP HW timestamping support
+- `ethtool -T eno2`: hardware-transmit, hardware-receive, hardware-raw-clock, PTP HW Clock: 1
 - `hwtimestamp *` is **commented out** in `/etc/chrony.conf` — free 10x improvement available
-- `linuxptp` installed, but no PTP grandmaster found on either network segment
+- `linuxptp` NOT installed (rpm missing), but kernel PTP infrastructure present: `/dev/ptp{0,1,2}`
 - We have full sudo access: can edit configs, restart services, install packages, run ptp4l
-- PTP devices: `/dev/ptp0` (I219), `/dev/ptp1` (I210/eno2), `/dev/ptp2` (I210/eno3)
+- PTP devices: `/dev/ptp0`, `/dev/ptp1` (I210/eno2), `/dev/ptp2`
+
+### Self-Contained PTP (No Grandmaster Needed)
+
+PTP between the two machines does NOT require PTP-aware switches or a CERN PTP grandmaster:
+- mkdev30 runs `ptp4l` as PTP master (its NTP clock is the reference)
+- mkdev16 runs `ptp4l` as PTP slave (syncs NIC HW clock to mkdev30)
+- On a quiet LAN with `igb` NICs: ~1-5µs accuracy WITHOUT PTP-aware switches
+- PTP-aware switches improve to ~100ns but ~1-5µs is sufficient for our ~16-28µs latency
+
+**However:** mkdev30's system clock is NTP-synced, not WR-synced. The WR time lives on
+the WREN PCIe card. To use PTP for true end-to-end latency measurement, we'd need to
+bridge the WREN card's WR clock to the NIC's PTP hardware clock via `phc2sys`-style
+bridging from BAR1 time registers to `/dev/ptp1`. This is non-trivial.
+
+**Practical implication:** PTP gives ~1µs relative sync between the two FECs' system clocks.
+This is useful for comparing `clock_gettime()` timestamps but cannot directly measure the
+latency from "WREN card fires PULSE" to "mkdev16 receives packet" since those are different
+clock domains.
 
 **cfd-865-mkdev50 (ARM64, Zynq UltraScale+ MPSoC):**
 
@@ -459,6 +587,89 @@ A PTP grandmaster would additionally provide:
 **For Option C (hybrid) this difference is irrelevant** — the slave fires on trigger packets
 from the master, never consulting its own clock for firing decisions. Clock sync only matters
 for logging timestamps and for Option A (schedule-based local firing).
+
+---
+
+## Transmitter Lookup Table Design
+
+The transmitter enriches FIRE packets with metadata (eventId, channel, offsetMs) at zero
+hot-path cost. This is achieved through two-level flat array indexing:
+
+### Level 1: `m_actMeta[act_idx]` — Action metadata (populated once at startup)
+- `std::array<CompEntry, 2048>` indexed directly by firmware act_idx
+- Populated by `installActionMap()` from the discovery results (~19 entries)
+- Default entries have sentinel values: `{eventId=0, channel=0xFF, offsetMs=0xFFFF}`
+- CTIM fire entries (act_idx 2040-2042) baked with sentinels at discovery time
+- Size: 2048 × 6 bytes ≈ 12KB, fits in L2 cache
+
+### Level 2: `m_compInfo[sw_cmp_idx]` — Per-comparator cache (populated by CONFIG)
+- `std::array<CompEntry, 512>` indexed by sw_cmp_idx from CONFIG capsule
+- CONFIG handler: `m_compInfo[swCmp] = m_actMeta[actIdx]` — single array copy, ~1ns
+- PULSE handler: `sendFire(m_compInfo[comp], sec, nsec)` — already in L1 from CONFIG
+
+### CompEntry struct (6 bytes, no padding concerns)
+```cpp
+struct CompEntry {
+    std::uint16_t eventId{};          // CTIM event ID (0 = unknown)
+    std::uint8_t  channel{0xFF};      // 1-based wrentest channel (0xFF = sentinel/CTIM)
+    std::uint16_t offsetMs{0xFFFF};   // delay in ms (0xFFFF = sentinel/CTIM)
+};
+```
+
+### Hot Path Cost
+- CONFIG: 1 array index + 1 struct copy = ~1ns (was: 20-entry linear scan = ~40ns)
+- PULSE: 1 array read + 1 `sendFire()` = unchanged (metadata already in cache line)
+- No branches, no CTIM/LTIM distinction in transmitter code
+
+---
+
+## Latency Measurement Options
+
+### The Challenge
+- TX side (mkdev30): WR time on WREN card (sub-ns), system clock NTP (~20µs RMS)
+- RX side (mkdev16): system clock NTP (~27µs RMS)
+- FIRE packet timestamps come from WREN card (WR domain), not from host clock
+- Cannot subtract host `clock_gettime()` from WREN-card timestamps (different clock domains)
+- NTP relative offset between two machines (~30-50µs) is same order as target latency (~16-28µs)
+
+### Option A: RDTSC on TX Side (Recommended First Step)
+Measure CPU cycles from "PULSE capsule read" to "packet commit". Isolates TX software overhead.
+```cpp
+auto t0 = __rdtsc();
+// ... PCIe read + build packet + commit ...
+auto t1 = __rdtsc();
+// tx_processing_ns = (t1 - t0) / tsc_freq_ghz
+```
+- Pro: Zero infrastructure, ~20 cycle overhead, can leave in production
+- Con: Only measures TX software path, not wire + RX
+
+### Option B: Loopback on mkdev30 (Recommended Second Step)
+Run TX + RX on the same machine (or loopback cable on eno2). Same clock → perfect accuracy.
+Measures: TX software + kernel + NIC TX + wire + NIC RX + kernel + RX software.
+- Pro: Accurate round-trip, no clock sync issues, no infra needed
+- Con: Doesn't include inter-switch hop, dividing by 2 assumes symmetric path
+
+### Option C: Self-Contained PTP Between mkdev30 ↔ mkdev16
+Run `ptp4l` with mkdev30 as master, mkdev16 as slave. Both NICs (`igb`, I210) have full
+PTP HW timestamping. No PTP grandmaster or PTP-aware switches needed.
+- `linuxptp` package needed (not currently installed)
+- Expected accuracy: ~1-5µs on quiet LAN without PTP-aware switches
+- Enable `hwTimeStamp = true` on RX side (already a config option)
+- Latency = `RX_hw_timestamp - clock_gettime(CLOCK_REALTIME)` on TX at send time
+- **Note:** This measures host-to-host, not WREN-card-to-host (different clock domains)
+
+### Option D: WR Clock Bridge (Future, Non-Trivial)
+Bridge the WREN card's WR time registers (BAR1 TM_TAI_LO/CYCLES) to the NIC's PTP HW
+clock via a custom `phc2sys`-style daemon. Would enable true end-to-end measurement:
+`WREN_fire_time → NIC_HW_TX_time → wire → NIC_HW_RX_time`.
+- Pro: True end-to-end with WR precision
+- Con: Requires writing custom clock bridging software
+
+### Practical Plan
+1. Start with **Option A** (RDTSC) — quantify TX software overhead, free and instant
+2. Then **Option B** (loopback) — measure full round-trip on single machine
+3. Then **Option C** (PTP) — measure host-to-host one-way with ~1-5µs accuracy
+4. Option D only if sub-µs end-to-end measurement is required
 
 ---
 
@@ -570,20 +781,33 @@ mmap PCIe BAR1 → busy-poll async_board_off → read new capsule(s) →
     other?           → forward verbatim (diagnostics, config messages)
 ```
 
-**Wire format** (custom Ethernet frame between master and slave):
+**Wire format (implemented):**
 ```
-Bytes 0-5:   Dst MAC
-Bytes 6-11:  Src MAC
-Bytes 12-13: EtherType (0x88B5)
-Byte  14:    Version (0x01)
-Byte  15:    Flags: bit 0 = ADVANCE, bit 1 = FIRE
-Byte  16:    Capsule count
-Bytes 17+:   Raw capsule words (copied verbatim from WREN async ring)
+Bytes 0-5:   Dst MAC (cfc-865-mkdev16 eno2)
+Bytes 6-11:  Src MAC (cfc-865-mkdev30 eno2)
+Bytes 12-13: EtherType (0x88B5, IEEE local experimental)
+Byte  14+:   Payload (one packet type per frame, 64-byte minimum)
 ```
 
-ADVANCE packets carry full capsule data (event ID, due-time, parameters).
-FIRE packets carry only comp_idx + timestamp (~12 bytes payload) — minimal critical-path work.
-Multiple capsules batched when they arrive in the same poll cycle.
+**ADVANCE payload** (14 bytes at offset 14):
+```
+[type=1:1][0:1][evId:2][slot:2][sec:4][nsec:4]
+```
+Carries the CTIM event's scheduled due-time (seconds in advance).
+
+**FIRE payload (enriched)** (16 bytes at offset 14):
+```
+[type=2:1][0:1][evId:2][sec:4][nsec:4][ch:1][0:1][offsetMs:2]
+```
+Carries the actual fire time + action metadata resolved at CONFIG time.
+- `evId`: which CTIM triggered this action (e.g., 142 = PIX.AMCLO-CT)
+- `ch`: wrentest 1-based channel (0xFF = sentinel → CTIM fire, no physical channel)
+- `offsetMs`: delay from CTIM in ms (0xFFFF = sentinel → CTIM fire)
+
+**Sentinel values for CTIM fires:** `ch=0xFF, offsetMs=0xFFFF`.
+The transmitter is completely dumb — it stamps whatever metadata was pre-populated
+in the flat lookup table at startup. The receiver classifies by checking sentinels:
+`ch == 0xFF` → CTIM_FIRE, else → LTIM_FIRE.
 
 **Estimated latency (FIRE packet)**: ~4-6µs from firmware ring write to wire (less than
 ADVANCE because smaller packet, less data to read from PCIe).
@@ -784,34 +1008,86 @@ gentler socket backend. The x86 FEC with dedicated NICs gets full packet_mmap + 
 
 ---
 
-## New Source Files
+## Source Files (Implemented)
 
-| File | Purpose | Lines (est) |
-|------|---------|-------------|
-| `src/WrenPeek.hpp/cpp` | PCIe BAR1 mmap + read32 (RAII) | ~80 |
-| `src/WrenRingPoller.hpp/cpp` | Async ring poller + capsule extraction | ~120 |
-| `src/SidecarFrame.hpp` | Wire format builder/parser (ADVANCE + FIRE flags) | ~70 |
-| `src/SpscQueue.hpp` | Lock-free SPSC queue (header-only) | ~80 |
-| `src/TimingEvent.hpp` | 64-byte event struct (header-only) | ~30 |
-| `src/ArmedEvents.hpp` | Pre-armed comparator array (Option C) | ~60 |
-| `src/EventScheduler.hpp/cpp` | Sorted list + two-phase timer (Option A) | ~150 |
-| `src/TaiClock.hpp/cpp` | CLOCK_TAI utils + vDSO busy-spin | ~60 |
-| `src/SidecarStats.hpp/cpp` | Jitter tracking + histogram | ~80 |
-| `app/sidecar_master.cpp` | Master main (poll + classify + forward) | ~140 |
-| `app/sidecar_slave.cpp` | Slave main (3 threads, mode switch) | ~220 |
-| **Total** | | **~1090** |
+| File | Purpose | Status |
+|------|---------|--------|
+| `src/WRENProtocol.hpp` | Wire format constants, capsule types, PktType enum | Done |
+| `src/WRENTransmitter.hpp` | PCIe ring poller + packet_mmap TX (single header) | Done |
+| `src/WRENTransmitter.cpp` | transmitAll() busy-poll loop, register dump | Done |
+| `src/WRENCTIMConfigurator.hpp` | CTIM config class, mailbox constants, ActionInfo struct | Done |
+| `src/WRENCTIMConfigurator.cpp` | Mailbox commands, action discovery, setup/cleanup | Done |
+| `src/WRENReceiver.hpp` | packet_mmap RX + debug log parsing (single header) | Done |
+| `src/WRENReceiver.cpp` | Constructor (minimal) | Done |
+| `src/main.cpp` | TX/RX mode switch, NicTuner, watchdog, system tuning | Done |
 
-### Implementation Order
-1. WrenPeek + WrenRingPoller (PCIe access, validate on real WREN hardware)
-2. SidecarFrame + TimingEvent (wire format with ADVANCE/FIRE flags, capsule parser)
-3. sidecar_master (poll + classify CMD_ASYNC_EVENT vs CMD_ASYNC_PULSE + forward)
-4. SpscQueue (lock-free queue, unit test throughput)
-5. TaiClock (TAI utilities, test vDSO latency)
-6. ArmedEvents (Option C pre-arm array, unit test with synthetic events)
-7. EventScheduler (Option A sorted list + timer, unit test)
-8. SidecarStats (jitter tracking)
-9. sidecar_slave (integrate everything, compile-time mode switch)
-10. End-to-end test (master on WREN FEC ↔ slave on spare FEC, measure jitter)
+### Dependencies (fetched via CMake FetchContent)
+| Repo | Target | Provides |
+|------|--------|----------|
+| ABTEdge | `fpga_backend` | PCIeBackend, BackendBase, x86_64Tuner |
+| ABTRDA3 | `abtrda3` | PacketMmapTx, PacketMmapRx, NicTuner, SocketOps |
+
+### Build
+```bash
+cmake -G Ninja -B build/x86_64-release -DCMAKE_BUILD_TYPE=Release
+ninja -C build/x86_64-release
+# Binary: build/x86_64-release/abtwren
+# TX: sudo taskset -c 4 ./abtwren --tx   (on mkdev30)
+# RX: sudo taskset -c 4 ./abtwren --rx   (on mkdev16)
+```
+
+### Planned (Not Yet Implemented)
+| File | Purpose |
+|------|---------|
+| `SPSCQueue/` | Lock-free SPSC queue (header-only, already in repo) |
+| Dispatch thread | SPSC consumer: pre-arm on ADVANCE, execute on FIRE |
+| RDTSC instrumentation | TX-side latency measurement in PULSE handler |
+
+### Implementation Order (remaining)
+1. SPSC queue integration (RX thread pushes, dispatch thread pops)
+2. RDTSC latency instrumentation on TX PULSE handler
+3. Loopback latency test on mkdev30
+4. PTP setup between mkdev30 ↔ mkdev16 for end-to-end measurement
+5. Dispatch thread with pre-armed event array (Option C)
+6. ABTEdge FPGA output on slave side
+
+---
+
+## Validated End-to-End Results (Feb 21 2026)
+
+### TX Side (mkdev30, 30s run)
+```
+[CTIM] Discovering firmware actions...
+  act[0]  → ev_id:142  ch:23  offset:50ms
+  act[1]  → ev_id:138  ch:22  offset:900ms
+  act[2]  → ev_id:143  ch:22  offset:900ms
+  act[12] → ev_id:143  ch:20  offset:10ms
+  act[13] → ev_id:143  ch:21  offset:100ms
+  act[15] → ev_id:138  ch:21  offset:100ms
+  (+ 10 external-trigger entries with ev_id:0)
+[CTIM] Discovered 19 firmware actions (16 LTIM + 3 CTIM)
+```
+
+### RX Side (mkdev16, enriched FIRE packets)
+```
+LTIM_FIRE  ev_id:143  ch:20  +10ms   at:1771686284.180000000
+LTIM_FIRE  ev_id:143  ch:21  +100ms  at:1771686284.270000000
+LTIM_FIRE  ev_id:138  ch:22  +900ms  at:1771686285.070000000
+CTIM_FIRE  ev_id:142  at:1771686285.070000000
+LTIM_FIRE  ev_id:142  ch:23  +50ms   at:1771686285.120000000
+CTIM_FIRE  ev_id:143  at:1771686285.310000000
+LTIM_FIRE  ev_id:143  ch:20  +10ms   at:1771686285.320000000
+LTIM_FIRE  ev_id:143  ch:21  +100ms  at:1771686285.410000000
+```
+
+### What's Working
+- All 3 target CTIMs received as CTIM_FIRE (ev_id 142, 143, 138)
+- All 6 LTIM configurations received as LTIM_FIRE with correct ev_id, channel, offset
+- Enriched payload: receiver can fully identify every fire without external lookup tables
+- Transmitter is fully dumb: one sendFire() path, no CTIM/LTIM branching
+- WRENCTIMConfigurator: creates actions at startup, cleans up in destructor
+- Action discovery: correct parsing of GET_ACTION/GET_COND firmware replies
+- Flat array lookup: O(1) CONFIG→PULSE metadata resolution
 
 ---
 
@@ -823,6 +1099,11 @@ gentler socket backend. The x86 FEC with dedicated NICs gets full packet_mmap + 
 - Kernel driver: `wren-gw/sw/drivers/wren-core.c`
 - Userspace API: `wren-gw/sw/api/include/wren/wrenrx.h`
 - Event ID catalog: `timing-wrt/timing-domain-cern/src/timing-domain-cern/*.cpp`
+- Firmware action struct: `wren-gw/sw/firmware/common/wrenrx-data.h` (line 98: `struct wren_rx_action`)
+- Firmware condition struct: `wren-gw/sw/firmware/common/wrenrx-data.h` (line 73: `struct wren_rx_cond`)
+- Firmware GET_ACTION handler: `wren-gw/sw/firmware/common/wrenrx-cmd.c` (line 1271)
+- Firmware GET_COND handler: `wren-gw/sw/firmware/common/wrenrx-cmd.c` (line 865)
+- Host action display: `wren-gw/sw/host/wren-drvtst.c` (line 1772: `disp_rx_action()`)
 
 ## packet_mmap Forwarding Layer (ABTRDA3)
 
