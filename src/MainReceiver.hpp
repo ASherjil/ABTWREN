@@ -21,8 +21,16 @@
 
 class MainReceiver {
 public:
-    MainReceiver(const char* interface, int pollerCore, int processorCore,
-                 std::size_t queueCapacity);
+    MainReceiver(const char* interface, int pollerCore, int processorCore, std::size_t queueCapacity);
+
+    // Rule of 5: special member functions not needed so delete them
+    MainReceiver(const MainReceiver&) = delete;
+    MainReceiver(MainReceiver&&) = delete;
+    MainReceiver& operator=(const MainReceiver&) = delete;
+    MainReceiver& operator=(MainReceiver&&) = delete;
+
+    // Destructor safely terminates the threads
+    ~MainReceiver();
 
     // Spawn both jthreads with core pinning and RT priority.
     void start();
@@ -32,14 +40,6 @@ public:
 
     // Join both threads.
     void wait();
-
-    ~MainReceiver();
-
-    MainReceiver(const MainReceiver&) = delete;
-    MainReceiver(MainReceiver&&) = delete;
-    MainReceiver& operator=(const MainReceiver&) = delete;
-    MainReceiver& operator=(MainReceiver&&) = delete;
-
 private:
     const char* m_interface;
     int         m_pollerCore;

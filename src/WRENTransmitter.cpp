@@ -86,6 +86,16 @@ void WRENTransmitter::performRegisterDump() const {
 }
 
 
+void WRENTransmitter::installActionMap(const std::vector<ActionInfo>& map) {
+    for (const auto& a : map) {
+        if (a.actIdx < kMaxActIdx) {
+            m_actMeta[a.actIdx].eventId  = a.eventId;
+            m_actMeta[a.actIdx].channel  = a.channel;
+            m_actMeta[a.actIdx].offsetMs = static_cast<std::uint16_t>(a.offsetNs / 1'000'000);
+        }
+    }
+}
+
 // Builds the 64-byte frame template and stamps it into every TX ring slot.
 // After this, the hot path never writes bytes 0-13 — only the payload changes.
 void WRENTransmitter::setMacAddresses(const std::array<std::uint8_t, 6>& src, const std::array<std::uint8_t, 6>& dst) {

@@ -14,7 +14,7 @@ void EventProcessor::operator()(std::stop_token stopToken) {
 
     while (!stopToken.stop_requested()) {
         auto* ev = m_queue.front();
-        if (ev) {
+        if (ev)[[unlikely]] {
             processEvent(*ev);
             m_queue.pop();
         }

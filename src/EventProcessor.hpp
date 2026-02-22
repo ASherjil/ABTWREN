@@ -22,10 +22,10 @@ public:
 
     // Thread entry point — busy-polls queue, drains remaining items after stop.
     void operator()(std::stop_token stopToken);
-
 private:
     rigtorp::SPSCQueue<TimingEvent>& m_queue;
 
+    // TODO: With actual processing make this function [[gnu::always_inline]] and inline void
     void processEvent(const TimingEvent& ev);
 };
 

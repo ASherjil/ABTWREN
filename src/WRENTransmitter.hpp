@@ -64,15 +64,7 @@ public:
     /// Install the discovered action map into a flat array indexed by act_idx.
     /// Called once at startup before transmitAll(). CONFIG handler then does
     /// a single array copy: m_compInfo[swCmp] = m_actMeta[actIdx].
-    void installActionMap(const std::vector<ActionInfo>& map) {
-        for (const auto& a : map) {
-            if (a.actIdx < kMaxActIdx) {
-                m_actMeta[a.actIdx].eventId  = a.eventId;
-                m_actMeta[a.actIdx].channel  = a.channel;
-                m_actMeta[a.actIdx].offsetMs = static_cast<std::uint16_t>(a.offsetNs / 1'000'000);
-            }
-        }
-    }
+    void installActionMap(const std::vector<ActionInfo>& map);
 
     // Ethernet frame layout: [dst:0-5][src:6-11][ethertype:12-13][payload:14+]
     void setMacAddresses(const std::array<std::uint8_t, 6>& src, const std::array<std::uint8_t, 6>& dst);
