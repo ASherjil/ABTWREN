@@ -137,8 +137,8 @@ void WRENCTIMConfigurator::discoverActions() {
         auto channel = static_cast<std::uint8_t>(pulserIdx + 1);  // wrentest 1-based
         m_actionMap.push_back({static_cast<std::uint16_t>(idx), eventId, channel, offsetNs});
 
-        std::printf("  act[%u] → ev_id:%u  ch:%u  offset:%lldms\n",
-                    idx, eventId, channel, static_cast<long long>(offsetNs / 1'000'000));
+        std::printf("  act[%u] → ev_id:%u  ch:%u  offset:%u cycles\n",
+                    idx, eventId, channel, idelay/*static_cast<long long>(offsetNs / 1'000'000)*/);
     }
 
     // Add our own CTIM fire actions (act_idx 2040+ not found by 0..255 scan).
