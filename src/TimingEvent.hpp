@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <type_traits>
+#include <atomic>
 
 struct TimingEvent {
     PktType       pktType;    // 1B: PKT_ADVANCE or PKT_FIRE
@@ -23,7 +24,17 @@ struct TimingEvent {
     std::uint32_t nsec;       // 4B: nanoseconds
 };
 
+// Use 64 bytes to fill the L1/L2 cache to avoid false sharing and cache misses
+struct alignas(64) ShmEventSlot{
+    std::atomic<std::uint64_t> seq;
+    TimingEvent                event;
+    // Implicit 40B of padding from alignas(64) to fill the cache line
+};
+
 static_assert(std::is_trivially_copyable_v<TimingEvent>);
 static_assert(sizeof(TimingEvent) == 16);
+
+static_assert(sizeof(ShmEventSlot) == 64);
+static_assert(alignof(ShmEventSlot) == 64);
 
 #endif // ABTWREN_TIMINGEVENT_HPP

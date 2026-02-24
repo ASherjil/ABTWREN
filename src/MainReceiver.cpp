@@ -30,8 +30,7 @@ MainReceiver::MainReceiver(const char* interface, int pollerCore,
           cfg.hwTimeStamp = false;
           return cfg;
       }(), m_queue}
-    , m_processor{m_queue}
-{
+    , m_processor{kShmName, m_queue} {
     // NicTuner: disable coalescing, offloads, RT throttling,
     // pin NIC IRQs to pollerCore, boost ksoftirqd to FIFO:50.
     // Destructor only closes ethtool fd — all settings persist until reboot.

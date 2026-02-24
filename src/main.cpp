@@ -156,6 +156,7 @@ static void runTransmitter() {
         {142, 24},  // PIX.AMCLO-CT  → pulser 24
         {143, 25},  // PIX.F900-CT   → pulser 25
         {138, 26},  // PI2X.F900-CT  → pulser 26
+        {156, 27},  // PX.SCY-CT     → pulser 27 (Start Cycle, needed by MKController)
     });
 
     transmitter.installActionMap(ctimConfig.actionMap());
