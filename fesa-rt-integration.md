@@ -981,3 +981,167 @@ POD struct flows from NIC hardware through three spin-poll hops to FESA RT actio
 kernel involvement on the hot path, and production-quality TimingContext make it the clear
 winner. The only costs are modifying KiTSGeneric (which we can freely do) and dedicating one
 additional core to spin-polling in the FESA process.
+
+---
+
+## Path C Implementation — Completed (2026-02-24)
+
+End-to-end working: mkdev16 receives real CPS timing events from mkdev30 via Ethernet,
+FESA RT actions fire on mkdev16 without any WREN hardware.
+
+### FESA Build Setup
+
+#### Build Order (Critical)
+
+Classes must be built in dependency order:
+
+```bash
+cd /path/to/FESA_9_0_0/MKRcps     && make -j8 CPU=deb12x64 ABT_LIBS=DEV
+cd /path/to/FESA_9_0_0/MKPfn      && make -j8 CPU=deb12x64 ABT_LIBS=DEV
+cd /path/to/FESA_9_0_0/MKController && make -j8 CPU=deb12x64 ABT_LIBS=DEV
+cd /path/to/FESA_9_0_0/KiTSGeneric && make -j8 CPU=deb12x64 ABT_LIBS=DEV
+```
+
+MKController depends on MKRcps and MKPfn build artifacts (headers in `build/include/`).
+
+#### Makefile.specific Changes (All 4 Classes)
+
+Each `Makefile.specific` needs two changes:
+
+1. **C++17**: Change `-std=c++11` to `-std=c++17` (for digit separators, single-arg static_assert)
+2. **Include path**: Add `-I../KiTSGeneric/src` (for `EthTimingSourceCore.h`)
+
+Example (`MKRcps/Makefile.specific`):
+```makefile
+USER_CFLAGS  = -std=c++17 -I../KiTSGeneric/src -I/path/to/ABT/libs...
+USER_LDFLAGS = ...
+```
+
+### EthTimingSourceCore.h — CRTP Template
+
+Location: `KiTSGeneric/src/KiTSGeneric/Common/EthTimingSourceCore.h`
+
+This is the shared core for all three FESA classes. Each class has a thin ~20-line
+`EthTimingSource.h` wrapper that inherits `EthTimingSourceCore<GeneratedBase>` and
+populates the channel/CTIM mapping arrays.
+
+#### Key Design Decisions
+
+1. **Resilient shm_open**: `connect()` calls `tryOpenShm()` (best-effort, no throw).
+   If the ABTWREN receiver isn't running yet, `wait()` polls every 500ms until the
+   shared memory becomes available.
+
+2. **Clean shutdown via `isRunning()`**: The FESA `Thread` base class provides
+   `isRunning()` (a `boost::atomic<bool>`). Check it in both the shm-wait loop
+   and the main poll loop to prevent deadlock on Ctrl+C:
+
+   ```cpp
+   // Shutdown-aware shm wait
+   while (!m_slot && this->isRunning()) {
+       ::usleep(500'000);
+       tryOpenShm();
+   }
+   if (!this->isRunning()) return;
+
+   // Main poll loop
+   for (;;) {
+       if (!this->isRunning()) return;
+       // ... poll shm seq ...
+       ::usleep(200);  // 200us — prevents CPU starvation
+   }
+   ```
+
+3. **CPU-friendly polling with `usleep(200)`**: Without this, 3 FESA RT threads
+   (one per class) each consume 100% CPU spinning. With 200us sleep, CPU usage
+   drops to near-zero while adding negligible latency (timing events arrive every
+   few ms at most).
+
+4. **Torn-read guard**: Double-check the seq counter before and after reading the
+   TimingEvent to detect concurrent writer updates:
+
+   ```cpp
+   uint64_t seq = m_slot->seq.load(std::memory_order_acquire);
+   if (seq != m_lastSeq) {
+       TimingEvent ev;
+       std::memcpy(&ev, &m_slot->event, sizeof(TimingEvent));
+       uint64_t seq2 = m_slot->seq.load(std::memory_order_acquire);
+       if (seq2 != seq) { m_lastSeq = seq2; continue; } // torn read
+       // ... process ev ...
+   }
+   ```
+
+5. **Channel/CTIM mapping**: Flat arrays for O(1) lookup:
+   - `m_channelMap[channel]` → CustomEvents enum value (LTIM events)
+   - `m_ctimMap[index]` → CustomEvents enum value (CTIM events, matched by eventId)
+
+### Instance File Changes (mkdev16)
+
+Location: `KiTSGeneric/src/test/cfc-865-mkdev16/DeviceData_KiTSGeneric.instance`
+
+#### Removed Devices
+
+RCPS.B/C/D and PFN.B/C/D were removed — they had no setting/acquisition sections
+and caused `FESA_10012 Invalid argument: Dimension of field missing or invalid`.
+
+Remaining devices: 1 Controller, 1 RCPS.A, 1 PFN.A, 3 Global instances.
+
+Validate after changes:
+```bash
+xmllint --noout DeviceData_KiTSGeneric.instance    # well-formedness
+fesa3 -s KiTSGeneric.deploy                         # schema validation
+```
+
+### Operational Notes
+
+#### CPU Starvation Prevention
+
+With NicTuner active (disables RT throttling) + SCHED_FIFO threads + FESA spin loops,
+the FEC can hard-lock (no Ctrl+C, no watchdog rescue, requires reboot).
+
+**Fix**: Either:
+- Comment out `NicTuner` and `pinThread()` calls during development
+- Or ensure FESA EthTimingSource threads use `usleep()` (not bare spin)
+
+#### Known Non-Fatal Errors
+
+- `MKDEV16.PFN.GD not known in CMW Directory Service` — WatchDog publishes status
+  via RDA/CMW, but this global device isn't registered. Repeats every ~1s. Harmless.
+- `Timing receiver unspecified, selecting best available / Got CtrReceiver` — FESA's
+  internal timing receiver (for supercycle context), NOT our EthTimingSource. Benign.
+
+### Reproducing for Another FESA Class
+
+To add EthTimingSource to a new FESA class `MyClass`:
+
+1. **Design file**: Add a Custom event source named `EthTimingSource` with logical
+   events for each timing channel you need (e.g., `leEthCh1_NC`, `leEthCh2_EC`)
+
+2. **Regenerate code**: FESA codegen creates `EthTimingSourceBase` in
+   `MyClass/GeneratedCode/`
+
+3. **Create wrapper**: `MyClass/src/MyClass/RealTime/EthTimingSource.h`
+   ```cpp
+   #include <KiTSGeneric/Common/EthTimingSourceCore.h>
+   #include "MyClass/GeneratedCode/CustomEventSourceGen.h"
+
+   class EthTimingSource : public EthTimingSourceCore<EthTimingSourceBase> {
+   public:
+       EthTimingSource(const std::string& name,
+                       const fesa::AbstractServiceLocator* sl,
+                       const std::map<std::string, const fesa::AbstractServiceLocator*>& related)
+           : EthTimingSourceCore(name, sl, related)
+       {
+           // Map LTIM channels to CustomEvents enum values
+           m_channelMap[1] = CustomEvents::leEthCh1_NC;
+           m_channelMap[2] = CustomEvents::leEthCh2_EC;
+           // ... etc
+       }
+   };
+   ```
+
+4. **Makefile.specific**: Add `-std=c++17 -I../KiTSGeneric/src`
+
+5. **Instance file**: Add `<EthTimingSource>` entries in each device's
+   events-mapping section, with logical events mapped to the Custom event source
+
+6. **Build**: Follow the dependency order (parent classes first, deploy unit last)
