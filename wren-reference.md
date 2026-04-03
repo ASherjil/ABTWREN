@@ -660,3 +660,121 @@ Command-line diagnostic tool with hierarchical sub-commands:
 | **ICALEPCS'25 paper** | WEBR003 (Moscardi et al.) |
 
 All source paths under `/opt/public/FESA_core_repos/` prefixed with `WREN_LTIM/` or `timing/timing-wrt/`.
+
+---
+
+## FEC Boot Sequence: How WREN Is Actually Configured (Investigated Feb 2025)
+
+Investigated on `cfc-865-mkdev30` (PCIe WREN at BDF `03:00.0`, device `10dc:0455`).
+
+### The Boot Chain
+
+1. **Power-on**: FPGA bitstream loads from flash. R5 firmware boots from flash, enters `main_loop()` (polls mailbox, NIC, pulsers). WR Core (RISC-V) also boots and begins PTP sync.
+
+2. **`fec-hw.service`** (systemd): Runs `/usr/sbin/fec-hardware-setup`, which parses `/etc/transfer.ref` and executes each `#%` line via bash.
+
+3. **`transfer.ref`** contains: `#% cd /usr/local/drivers/wren; ./install.sh`
+
+4. **`install.sh`** → **`install-drv.sh`**, which does:
+
+### install-drv.sh Step-by-Step
+
+```
+Step 1: Parse transfer.ref for PCIe_WREN entries
+  awk for slot number → map to PCI BDF via /var/run/dynpci
+
+Step 2: Enable PCI memory space
+  setpci -s $pcie_slot COMMAND=0x02
+
+Step 3: Determine firmware build version
+  ./wren-ls driver-version pcie $pcie_slot  → reads BAR1 register → "fb000011"
+
+Step 4: Load WR PTP Core firmware (RISC-V)
+  ./wrpc load -b pci -f /sys/bus/pci/devices/0000:$slot/resource1 \
+      -o 0x1000 $drv_ver/wrc.elf
+  (Writes ELF into WR Core RAM at BAR1+0x1000)
+
+Step 5: Install shared libraries
+  ln -s $drv_ver/lib/libwrenrx.so* /tmp/wren/
+  ln -s $drv_ver/lib/libwrenrx.so* /run/wren/
+  ln -s $drv_ver/bin /run/wren/
+
+Step 6: Load kernel driver
+  insmod $drv_ver/wren-core.ko
+  insmod $drv_ver/wren-pcie.ko
+
+Step 7: Create /dev/wren* device links
+  chmod 666 /dev/wrenN
+```
+
+### What the Kernel Driver Does on Probe (wren-pcie.c → wren-core.c)
+
+```
+wren_pcie_probe():
+  1. pcim_enable_device()
+  2. Map BAR0 (PS DMA) and BAR1 (registers + mailbox)
+  3. Set DMA mask (64-bit or 32-bit fallback)
+  4. pci_set_master()
+  5. wren_register() → creates /dev/wrenN, sysfs entries
+  6. request_threaded_irq() → MSI interrupt for mailbox + async events
+  7. wren_init_hw():
+     - Clear all pending interrupts: iack = 0xffffff
+     - Set IMR = MSG | ASYNC | WR_SYNC | ALARM (+ CLOCK if already synced)
+     - Sync async_host_off = async_board_off (empty the ring)
+  8. wren_reset():
+     - CMD_RX_RESET via mailbox → firmware clears all subscriptions/actions
+     - CMD_HW_GET_CONFIG → firmware returns hardware capabilities
+```
+
+### The Broken State on mkdev30 (Feb 2025)
+
+**Root cause**: Kernel module compiled against different kernel config, CRC mismatch:
+```
+wren_core: disagrees about version of symbol module_layout
+```
+Running kernel: `5.10.245-rt139-fecos03`
+
+**Consequences**:
+- Steps 6-7 fail → no `/dev/wren*`, no interrupts, no `wren_reset()`
+- `wrpc load` (Step 4) disrupts R5 firmware — R5 sets `fw_version` register
+  but stops polling mailbox (`h2b_csr` commands are never consumed)
+- WR PTP Core still works (link_up=1, time_valid=1, TAI counting)
+- Mailbox is completely unresponsive (R5 main_loop not executing)
+
+### What We Can Do Without the Kernel Driver (Direct PCIe mmap)
+
+Our `WRENTester` (ABTEdge) bypasses the kernel driver entirely via BAR1 mmap:
+
+**Working** (confirmed on mkdev30):
+- Discover WREN via sysfs PCI scan (vendor=0x10DC, device=0x0455)
+- Map BAR1 via `mmap(/sys/bus/pci/devices/.../resource1)`
+- Read all host registers: IDENT, MAP_VER, FW_VER, WR_STATE, TAI time, ISR, IMR
+- Read async ring buffer (board_off / host_off pointers + capsule data)
+- Send mailbox commands: CMD_RX_SUBSCRIBE, CMD_RX_SET_COND, CMD_RX_SET_ACTION
+- Clean up: CMD_RX_DEL_ACTION, CMD_RX_DEL_COND
+
+**Requires R5 firmware running** (i.e. kernel module loads OR boot scripts don't kill R5):
+- Mailbox command/response (R5 polls `h2b_csr` in `main_loop()`)
+- Event subscription delivery to async ring
+- LTIM/pulser configuration and firing
+
+### Key Insight: R5 Firmware Architecture
+
+The R5 firmware (`main.c`) runs bare-metal on the ARM Cortex-R5 (PS side of Zynq).
+Its `main_loop()` polls these in a tight loop every iteration:
+1. WR sync state (`regs->wr_state`)
+2. NIC receive (`nic->eic.eic_isr`)
+3. **Mailbox** (`mb->h2b_csr` — this is what we need)
+4. Pulser interrupts (`regs->pulsers_int`)
+5. TX table polling
+6. SW comparator polling
+7. UART for CLI ('C' enters blocking menu — avoid sending chars to R5 UART)
+
+The mailbox is at BTCM (R5 side: `0xF0000000`, PCIe side: BAR1+0x10000).
+The `mb_map.h` struct defines: B2H (board→host) at +0x0000, H2B (host→board) at +0x1000,
+async ring at +0x2000, async pointers at +0x4000.
+
+### Fix Applied
+
+Kernel team recompiling all 17 failed modules for `5.10.245-rt139-fecos03`.
+Once `wren-core.ko` and `wren-pcie.ko` load, the standard boot sequence works end-to-end.

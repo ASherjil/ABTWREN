@@ -7,27 +7,28 @@
 //   TX:  sudo taskset -c 4 ./abtwren --tx
 //   RX:  sudo taskset -c 4,5 ./abtwren --rx
 
+#include "MainReceiver.hpp"
+#include "ShmSink.hpp"
+#include "WRENCTIMConfigurator.hpp"
 #include "WRENProtocol.hpp"
 #include "WRENTransmitter.hpp"
-#include "WRENCTIMConfigurator.hpp"
-#include "MainReceiver.hpp"
-#include <NicTuner.hpp>
 
+#include <NicTuner.hpp>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cerrno>
-#include <csignal>
-#include <sched.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <thread>
-#include <chrono>
 
 // =============================================================================
 // Configuration
 // =============================================================================
-
 constexpr const char* kInterface = "eno2";
 constexpr int         kCpuCore   = 4;
 
@@ -49,12 +50,20 @@ constexpr std::size_t kQueueCapacity   = 4096;
 // Globals
 // =============================================================================
 
+// Single bridege: preprocessor -> C++ type system
+#ifdef ABTWREN_USE_QUEUE
+inline constexpr bool kUseQueue = true;
+#else
+inline constexpr bool kUseQueue = false;
+#endif
+
+using ActiveSink     = std::conditional_t<kUseQueue, QueueSink, ShmSink>;
+using ActiveReceiver = MainReceiver<ActiveSink>;
+
 static volatile std::sig_atomic_t g_running = 1;
-static MainReceiver*              g_receiver = nullptr;
 
 static void sigint_handler(int) {
     g_running = 0;
-    if (g_receiver) g_receiver->requestStop();
 }
 
 // =============================================================================
@@ -65,7 +74,6 @@ static void sigint_handler(int) {
 // After kWatchdogSec it sets g_running = 0, causing the hot path to
 // return normally and destructors to run.
 // =============================================================================
-
 static void spawnTxWatchdog() {
     std::thread([](){
         cpu_set_t cpuset;
@@ -88,8 +96,8 @@ static void spawnTxWatchdog() {
 // =============================================================================
 // RX Watchdog — uses jthread + stop_token, calls MainReceiver::requestStop()
 // =============================================================================
-
-static std::jthread spawnRxWatchdog(MainReceiver& receiver) {
+template <typename Reciever>
+static std::jthread spawnRxWatchdog(Reciever& receiver) {
     return std::jthread([&receiver](std::stop_token st) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
@@ -109,6 +117,19 @@ static std::jthread spawnRxWatchdog(MainReceiver& receiver) {
     });
 }
 
+template<typename Receiver>
+static void runUntillSignal(Receiver& receiver) {
+    std::jthread watchdog = spawnRxWatchdog(receiver);
+    receiver.start();
+
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    receiver.requestStop();
+    receiver.wait();
+    watchdog.request_stop();
+}
 // =============================================================================
 // TX system tuning (applied before hot path)
 // =============================================================================
@@ -169,24 +190,24 @@ static void runTransmitter() {
 // =============================================================================
 // Receiver: packet_mmap RX → SPSC queue → EventProcessor
 // =============================================================================
-
+template <bool UseQueue = kUseQueue>
 static void runReceiver() {
     std::printf("[RX] WREN sidecar receiver on %s (poller=core%d, processor=core%d)\n",
                 kInterface, kPollerCore, kProcessorCore);
     std::printf("[RX] Watchdog: auto-shutdown in %d seconds\n", kWatchdogSec);
 
-    MainReceiver receiver(kInterface, kPollerCore, kProcessorCore, kQueueCapacity);
-    g_receiver = &receiver;
-
-    auto watchdog = spawnRxWatchdog(receiver);
-
-    std::printf("[RX] Starting poller + processor threads.\n");
-    receiver.start();
-    receiver.wait();
-
-    watchdog.request_stop();
-    // watchdog jthread joins in its destructor
-    g_receiver = nullptr;
+    if constexpr (UseQueue) {
+        rigtorp::SPSCQueue<TimingEvent> queue(kQueueCapacity);
+        QueueSink sink(queue);
+        EventProcessor processor(kShmName, queue);
+        MainReceiver<QueueSink> receiver(kInterface, kPollerCore, sink, &processor, kProcessorCore);
+        runUntillSignal(receiver);
+    }
+    else {
+        ShmSink sink(kShmName);
+        MainReceiver<ShmSink> receiver(kInterface, kPollerCore, sink);
+        runUntillSignal(receiver);
+    }
 }
 
 // =============================================================================

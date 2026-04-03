@@ -8,18 +8,16 @@
 
 #include "TimingEvent.hpp"
 #include "WRENProtocol.hpp"
-
 #include <PacketMmapRx.hpp>
-#include <rigtorp/SPSCQueue.h>
-
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stop_token>
 
+template <typename Sink>
 class WRENReceiver {
 public:
-    WRENReceiver(const RingConfig& cfg, rigtorp::SPSCQueue<TimingEvent>& queue);
+    WRENReceiver(const RingConfig& cfg, Sink& sink)
+        : m_ethernetSocket{cfg}, m_sink{sink} {}
 
     WRENReceiver(const WRENReceiver&) = delete;
     WRENReceiver(WRENReceiver&&) = delete;
@@ -27,17 +25,30 @@ public:
     WRENReceiver& operator=(WRENReceiver&&) = delete;
 
     // Thread entry point — busy-polls NIC, pushes events into queue.
-    void operator()(std::stop_token stopToken);
+    void operator()(std::stop_token stopToken) {
+        std::fprintf(stderr, "[WRENReceiver] Poller thread started.\n");
+
+        while (!stopToken.stop_requested()) {
+            RxFrame frame = m_ethernetSocket.tryReceive();
+
+            if (!frame.data.empty()) [[unlikely]] {
+                if (frame.data.size() >= kFrameSize) [[likely]] {
+                    parseAndEnqueue(frame);
+                    m_ethernetSocket.release();
+                }
+            }
+        }
+        std::fprintf(stderr, "[WRENReceiver] Poller thread exiting.\n");
+    }
 private:
-    PacketMmapRx                     m_ethernetSocket;
-    rigtorp::SPSCQueue<TimingEvent>& m_queue;
+    PacketMmapRx    m_ethernetSocket;
+    Sink&           m_sink;
 
     [[gnu::always_inline]]
     inline void parseAndEnqueue(const RxFrame& frame){
         const auto* p = frame.data.data() + kEthHdrLen;
 
         TimingEvent ev{};
-
         if (p[0] == PKT_ADVANCE) {
             ev.pktType = PKT_ADVANCE;
             ev.channel = 0;
@@ -60,8 +71,7 @@ private:
             return; // Unknown packet type — drop silently
         }
 
-        if (!m_queue.try_push(ev)) [[unlikely]]
-            std::fprintf(stderr, "[WRENReceiver] Queue full — dropped event %u\n", ev.eventId);
+        m_sink.push(ev);
     }
 };
 

@@ -61,11 +61,14 @@ target_link_libraries(wren_transmitter
     PRIVATE abtwren_flags
 )
 
+# ── Compile-time sink selection ─────────────────────────────────
+option(ABTWREN_USE_QUEUE "Use SPSC queue + EventProcessor thread (OFF = direct shm)" OFF)
+
 # ── WREN Receiver library ───────────────────────────────────────
 add_library(wren_receiver STATIC
-    src/WRENReceiver.cpp
+    src/ShmSink.cpp
+    src/QueueSink.cpp
     src/EventProcessor.cpp
-    src/MainReceiver.cpp
 )
 
 target_include_directories(wren_receiver PUBLIC
@@ -83,3 +86,7 @@ add_executable(abtwren src/main.cpp)
 target_link_libraries(abtwren
     PRIVATE wren_transmitter wren_receiver abtwren_flags
 )
+
+if(ABTWREN_USE_QUEUE)
+    target_compile_definitions(abtwren PRIVATE ABTWREN_USE_QUEUE)
+endif()

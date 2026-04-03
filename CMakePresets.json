@@ -52,6 +52,14 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "x86_64-release-queue",
+      "displayName": "x86_64 Release + SPSC Queue (CERN CDK)",
+      "inherits": "x86_64-release",
+      "cacheVariables": {
+        "ABTWREN_USE_QUEUE": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -70,6 +78,10 @@
     {
       "name": "native-release",
       "configurePreset": "native-release"
+    },
+    {
+      "name": "x86_64-release-queue",
+      "configurePreset": "x86_64-release-queue"
     }
   ]
 }
