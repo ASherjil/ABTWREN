@@ -24,17 +24,20 @@ struct TimingEvent {
     std::uint32_t nsec;       // 4B: nanoseconds
 };
 
-// Use 64 bytes to fill the L1/L2 cache to avoid false sharing and cache misses
-struct alignas(64) ShmEventSlot{
+// Use hardware cache-line alignment to avoid false sharing
+// Value is 64 on x86_64, 256 on some ARM64 compiler toolchains
+static constexpr std::size_t kCacheLine = std::hardware_destructive_interference_size;
+struct alignas(kCacheLine) ShmEventSlot{
     std::atomic<std::uint64_t> seq;
     TimingEvent                event;
-    // Implicit 40B of padding from alignas(64) to fill the cache line
+    // Implicit padding from alignas to fill the cache line
 };
 
 static_assert(std::is_trivially_copyable_v<TimingEvent>);
 static_assert(sizeof(TimingEvent) == 16);
+static_assert(std::is_trivially_copyable_v<ShmEventSlot>, "ShmEventSlot must be trivially copyable for ShmBackend");
 
-static_assert(sizeof(ShmEventSlot) == 64);
-static_assert(alignof(ShmEventSlot) == 64);
+static_assert(sizeof(ShmEventSlot) >= kCacheLine);
+static_assert(alignof(ShmEventSlot) == kCacheLine);
 
 #endif // ABTWREN_TIMINGEVENT_HPP

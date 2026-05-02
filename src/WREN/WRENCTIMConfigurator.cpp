@@ -4,7 +4,7 @@
 
 #include "WRENCTIMConfigurator.hpp"
 
-WRENCTIMConfigurator::WRENCTIMConfigurator(PCIeBackend& pcie,
+WRENCTIMConfigurator::WRENCTIMConfigurator(PCIeBackend<VendorDeviceDiscovery>& pcie,
                                            const std::vector<CtimTarget>& targets)
     : m_pcie{pcie}, m_targets{targets} {
     setupAll();

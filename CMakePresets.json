@@ -60,6 +60,24 @@
       "cacheVariables": {
         "ABTWREN_USE_QUEUE": "ON"
       }
+    },
+    {
+      "name": "arm64-release",
+      "displayName": "ARM64 Release (CERN CDK)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchain-arm64.cmake"
+      }
+    },
+    {
+      "name": "arm64-debug",
+      "displayName": "ARM64 Debug (CERN CDK)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchain-arm64.cmake"
+      }
     }
   ],
   "buildPresets": [
@@ -82,6 +100,14 @@
     {
       "name": "x86_64-release-queue",
       "configurePreset": "x86_64-release-queue"
+    },
+    {
+      "name": "arm64-release",
+      "configurePreset": "arm64-release"
+    },
+    {
+      "name": "arm64-debug",
+      "configurePreset": "arm64-debug"
     }
   ]
 }

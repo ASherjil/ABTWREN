@@ -7,7 +7,9 @@
 #define ABTWREN_EVENTPROCESSOR_HPP
 
 #include "TimingEvent.hpp"
+#include "backends/ShmBackend.hpp"
 
+#include <cstdio>
 #include <rigtorp/SPSCQueue.h>
 #include <stop_token>
 
@@ -19,15 +21,15 @@ public:
     EventProcessor(EventProcessor&&) = delete;
     EventProcessor& operator=(const EventProcessor&) = delete;
     EventProcessor& operator=(EventProcessor&&) = delete;
-    ~EventProcessor();
+    ~EventProcessor() = default;
     // Thread entry point — busy-polls queue, drains remaining items after stop.
     void operator()(std::stop_token stopToken);
 private:
 
     [[gnu::always_inline]]
     inline void processEvent(const TimingEvent& ev) {
-        m_shmSlot->event = ev;
-        m_shmSlot->seq.store(++m_seq, std::memory_order_release);
+        m_sharedMemoryRegion.ptr<ShmEventSlot>()->event = ev;
+        m_sharedMemoryRegion.ptr<ShmEventSlot>()->seq.store(++m_seq, std::memory_order_release);
 
         // TODO: Remove this for final production but keep for now, they are usefull debugs
         if (ev.pktType == PKT_ADVANCE) {
@@ -44,11 +46,9 @@ private:
         }
     }
 
-    rigtorp::SPSCQueue<TimingEvent>& m_queue;// Lock-free SPSC queue for popping items coming from the PacketMmapRx
-    ShmEventSlot*    m_shmSlot{};// mmap'd pointer to /dev/shm/abtwren_events
+    rigtorp::SPSCQueue<TimingEvent>& m_queue;// Lock-free SPSC queue for popping items coming from the Rx
+    ShmBackend<ShmMode::Writer> m_sharedMemoryRegion;
     std::uint64_t    m_seq{};// local copy of sequence counter
-    int              m_shmFd{}; // fd for cleanup
-    std::string      m_shmName{}; // const char* name such as /dev/shm/abtwren_events
 };
 
 #endif // ABTWREN_EVENTPROCESSOR_HPP

@@ -13,6 +13,7 @@
 #define ABTWREN_WRENCTIMCONFIGURATOR_H
 
 #include <PCIeBackend.hpp>
+#include <VendorDeviceDiscovery.hpp>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -72,7 +73,7 @@ class WRENCTIMConfigurator {
 public:
     /// @param pcie     Reference to the PCIeBackend owned by WRENTransmitter.
     /// @param targets  List of CTIMs to configure (event ID + pulser channel).
-    WRENCTIMConfigurator(PCIeBackend& pcie, const std::vector<CtimTarget>& targets);
+    WRENCTIMConfigurator(PCIeBackend<VendorDeviceDiscovery>& pcie, const std::vector<CtimTarget>& targets);
 
     ~WRENCTIMConfigurator();
 
@@ -98,7 +99,7 @@ private:
     void cleanupAll();
     void discoverActions();
 
-    PCIeBackend& m_pcie;
+    PCIeBackend<VendorDeviceDiscovery>& m_pcie;
     std::vector<CtimTarget> m_targets;
     std::vector<ActionInfo> m_actionMap;
 };

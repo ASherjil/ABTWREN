@@ -5,20 +5,26 @@
 #ifndef ABTWREN_SHMSINK_H
 #define ABTWREN_SHMSINK_H
 
+#include "backends/ShmBackend.hpp"
 #include "TimingEvent.hpp"
+
+#include <cstdio>
 
 class ShmSink {
 public:
+
   explicit ShmSink(const char* shmName);
 
   ShmSink(const ShmSink&) = delete;
+  ShmSink(ShmSink&&) = default;
   ShmSink& operator=(const ShmSink&) = delete;
-  ~ShmSink();
+  ShmSink& operator=(ShmSink&&) = default;
+  ~ShmSink() = default;
 
   [[gnu::always_inline]]
   inline void push(const TimingEvent& ev) {
-    m_shmSlot->event = ev;
-    m_shmSlot->seq.store(++m_seq, std::memory_order_release);
+    m_sharedMemoryRegion.ptr<ShmEventSlot>()->event = ev;
+    m_sharedMemoryRegion.ptr<ShmEventSlot>()->seq.store(++m_seq, std::memory_order_release);
 
     // TODO: Remove this for final production but keep for now, they are usefull debugs
     if (ev.pktType == PKT_ADVANCE) {
@@ -34,11 +40,11 @@ public:
                     ev.eventId, ev.channel, ev.offsetMs, ev.sec, ev.nsec);
     }
   }
+
 private:
-  ShmEventSlot* m_shmSlot{};
+  ShmBackend<ShmMode::Writer> m_sharedMemoryRegion;
   std::uint64_t m_seq{};
-  int           m_shmFd{};
-  std::string   m_shmName{};
+
 };
 
 #endif // ABTWREN_SHMSINK_H

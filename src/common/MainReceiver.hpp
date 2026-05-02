@@ -1,6 +1,6 @@
 //
-// MainReceiver — Orchestrator: owns SPSC queue, WRENReceiver (producer),
-// EventProcessor (consumer), and the two jthreads connecting them.
+// MainReceiver — Orchestrator: owns WRENReceiver (producer),
+// EventProcessor (consumer), and the jthreads connecting them.
 //
 // Thread architecture:
 //   jthread #1: WRENReceiver::operator()   — Core pollerCore,    SCHED_FIFO:49
@@ -15,41 +15,43 @@
 #include "WRENReceiver.hpp"
 #include "QueueSink.hpp"
 
+#include <RingConcepts.hpp>
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <thread>
 #include <sys/mman.h>
 
-template<typename Sink>
+template<RxRing Rx, typename Sink>
 class MainReceiver{
     static constexpr bool kQueueMode = std::is_same_v<Sink, QueueSink>;
 public:
-    MainReceiver(const char* interface, int pollerCore, Sink& sink, EventProcessor* processor = nullptr, int processorCore =-1)
-        :m_pollerCore{pollerCore}, m_processorCore{processorCore}, m_receiver{makeRxConfig(interface), sink}, m_processor{processor} {
-
-        //NicTuner tuner(interface, pollerCore);
+    MainReceiver(const char* iface, int pollerCore,
+                 Rx& ethernetSocket, Sink& sink,
+                 EventProcessor* processor = nullptr, int processorCore =-1)
+        :m_pollerCore{pollerCore}, m_processorCore{processorCore},
+         m_receiver{ethernetSocket, sink}, m_processor{processor} {
 
         if constexpr (kQueueMode) {
-            std::fprintf(stderr, "[MainReceiver] Constructor on %s " "(poller=core%d, processor=core%d, queue-mode)\n",
-                interface, pollerCore, processorCore);
+            std::fprintf(stderr, "[MainReceiver] %s (poller=core%d, processor=core%d, queue-mode)\n",
+                iface, pollerCore, processorCore);
         }
         else {
-            std::fprintf(stderr, "[MainReceiver] Constructor on %s " "(poller=core%d, direct-shm)\n", interface, pollerCore);
+            std::fprintf(stderr, "[MainReceiver] %s (poller=core%d, direct-shm)\n",
+                iface, pollerCore);
         }
     }
 
-    // Rule of 5: special member functions not needed so delete them
     MainReceiver(const MainReceiver&) = delete;
     MainReceiver(MainReceiver&&) = delete;
     MainReceiver& operator=(const MainReceiver&) = delete;
     MainReceiver& operator=(MainReceiver&&) = delete;
 
-    // Destructor safely terminates the threads
     ~MainReceiver() {
         requestStop();
         wait();
     }
 
-    // Spawn both jthreads with core pinning and RT priority.
     void start() {
         if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
             std::fprintf(stderr, "[Warn] mlockall failed: %s\n", std::strerror(errno));
@@ -66,7 +68,6 @@ public:
         }
     }
 
-    // Signal both threads to stop (signal-safe).
     void requestStop() {
         m_pollerThread.request_stop();
         if constexpr (kQueueMode) {
@@ -74,7 +75,6 @@ public:
         }
     }
 
-    // Join both threads.
     void wait() {
         if (m_pollerThread.joinable()) m_pollerThread.join();
         if constexpr (kQueueMode) {
@@ -86,22 +86,11 @@ private:
     int m_pollerCore;
     int m_processorCore;
 
-    WRENReceiver<Sink>  m_receiver;
-    EventProcessor*     m_processor;
+    WRENReceiver<Rx, Sink>  m_receiver;
+    EventProcessor*          m_processor;
 
     std::jthread m_pollerThread;
     std::jthread m_processorThread;
-
-    static RingConfig makeRxConfig(const char* interface) {
-        RingConfig cfg{};
-        cfg.interface   = interface;
-        cfg.direction   = RingDirection::RX;
-        cfg.blockSize   = 4096;
-        cfg.blockNumber = 64;
-        cfg.protocol    = kEtherType;
-        cfg.hwTimeStamp = false;
-        return cfg;
-    }
 
     static void pinThread(std::jthread& t, int core, int priority) {
         const pthread_t handle = t.native_handle();

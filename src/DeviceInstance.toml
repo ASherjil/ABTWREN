@@ -1,0 +1,18 @@
+
+# TODO: Transmitter
+# WREN: Vendor ID, Device ID
+# Transport type: packet_mmap, AF_XDP, Intel_i210, candence_gem
+# Interface: eno1, eth0, end0 etc
+# Mac address:
+# Driver: macb or igb otherwise leave blank for packet_mmap/AF_XDP
+# CPU core: 0,1,2,3. This is the core where you apply the NIC tuner
+
+# TODO: Reciever
+# Transport type: packet_mmap, AF_XDP, Intel_i210, candence_gem
+# Interface: eno1, eth0, end0 etc
+# Mac address:
+# Driver: macb or igb otherwise leave blank for packet_mmap/AF_XDP
+# CPU core: 0,1,2,3. This is the core where you apply the NIC tuner
+
+# TODO: Safety watchdog
+# Enter seconds of how long the watchdog should be 

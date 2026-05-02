@@ -46,19 +46,25 @@ target_link_options(abtwren_flags INTERFACE
     $<$<CONFIG:Release>:-flto>
 )
 
+# ── Include paths for subdirectories ──────────────────────────────
+set(ABTWREN_INCLUDE_DIRS
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/common>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/WREN>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/HAL>
+)
+
 # ── WREN Transmitter library ─────────────────────────────────────
 add_library(wren_transmitter STATIC
-    src/WRENTransmitter.cpp
-    src/WRENCTIMConfigurator.cpp
+    src/WREN/WRENTransmitter.cpp
+    src/WREN/WRENCTIMConfigurator.cpp
 )
 
-target_include_directories(wren_transmitter PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-)
+target_include_directories(wren_transmitter PUBLIC ${ABTWREN_INCLUDE_DIRS})
 
 target_link_libraries(wren_transmitter
-    PUBLIC  fpga_backend abtrda3
-    PRIVATE abtwren_flags
+    PUBLIC  abtedge_common abtrda3
+    PRIVATE abtwren_flags fmt::fmt
 )
 
 # ── Compile-time sink selection ─────────────────────────────────
@@ -66,25 +72,25 @@ option(ABTWREN_USE_QUEUE "Use SPSC queue + EventProcessor thread (OFF = direct s
 
 # ── WREN Receiver library ───────────────────────────────────────
 add_library(wren_receiver STATIC
-    src/ShmSink.cpp
-    src/QueueSink.cpp
-    src/EventProcessor.cpp
+    src/common/ShmSink.cpp
+    src/common/QueueSink.cpp
+    src/common/EventProcessor.cpp
 )
 
-target_include_directories(wren_receiver PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-)
+target_include_directories(wren_receiver PUBLIC ${ABTWREN_INCLUDE_DIRS})
 
 target_link_libraries(wren_receiver
-    PUBLIC  abtrda3 SPSCQueue
-    PRIVATE abtwren_flags
+    PUBLIC  abtrda3 SPSCQueue abtedge_common
+    PRIVATE abtwren_flags fmt::fmt
 )
 
 # ── Main executable ─────────────────────────────────────────────
 add_executable(abtwren src/main.cpp)
 
+target_include_directories(abtwren PRIVATE ${ABTWREN_INCLUDE_DIRS})
+
 target_link_libraries(abtwren
-    PRIVATE wren_transmitter wren_receiver abtwren_flags
+    PRIVATE wren_transmitter wren_receiver abtwren_flags fmt::fmt
 )
 
 if(ABTWREN_USE_QUEUE)

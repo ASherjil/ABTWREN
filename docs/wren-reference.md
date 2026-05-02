@@ -537,6 +537,222 @@ Userspace -> read(client_fd) -> wren_usr_read()
 
 ---
 
+## Full Event Delivery Path: FPGA Fire → Userspace Application
+
+This traces the complete latency chain for an LTIM pulse from the FPGA gateware
+through the R5 firmware, kernel driver, C library, and C++ framework to the
+application. At each stage the mechanism and typical latency are documented.
+
+### Stage 0: FPGA gateware — pulser fires
+
+The pulser comparator in the FPGA gateware matches the current TAI time against
+the scheduled fire time. The output pin transitions at the exact nanosecond.
+Simultaneously, a hardware interrupt is raised to the R5 firmware.
+
+| Mechanism | Latency |
+|-----------|---------|
+| Hardware comparator match + pin drive | **0 ns** (reference — the nanosecond-precision event) |
+
+### Stage 1: R5 firmware — capsule write + IRQ assertion
+
+File: `sw/firmware/common/wrenrx-cmd.c`, function `pulses_handler()`
+
+The R5 receives the pulser interrupt in its main loop. It reads the pulser FIFO,
+writes a PULSE capsule (type 0x04) to the `async_data[]` ring buffer in BTCM,
+advances `async_board_off`, and asserts the ASYNC interrupt bit in the host
+register space (`HOST_MAP_INTC.ISR`), generating a PCIe MSI interrupt to the host.
+
+| Mechanism | Latency |
+|-----------|---------|
+| R5 interrupt + capsule write + MSI assert | 1-5 µs |
+
+### Stage 2: Kernel driver — IRQ handler + client ring buffer
+
+File: `sw/drivers/wren-core.c`, functions `wren_irq_handler()` (line ~4468),
+`wren_irq_thread()`, `wren_irq_pulse()` (line ~4112)
+
+The host CPU receives the MSI. `wren_irq_handler()` reads the ISR, sees
+`HOST_MAP_INTC_ISR_ASYNC`, and returns `IRQ_WAKE_THREAD`. The kernel schedules
+the threaded IRQ handler, which:
+
+1. Reads `async_board_off` vs `async_host_off` from BAR1 via `ioread32()`
+2. For each new capsule between the pointers, reads the capsule data via `ioread32()`
+3. Allocates a buffer from the 256-entry kernel buffer pool (lock-free CAS)
+4. Copies the capsule into the buffer
+5. Iterates over `client_configs[config_id]` bitmap to find subscribed clients
+6. Writes `CMD_ASYNC_PULSE | (buf_idx << 8)` to each client's ring buffer
+7. Calls `wren_update_client_msg()` → `atomic_set(&client->ring_tail)` + `wake_up(&client->wqh)`
+
+| Mechanism | Latency |
+|-----------|---------|
+| IRQ dispatch + threaded handler + `wake_up()` | 5-15 µs |
+
+### Stage 3: Kernel driver — userspace `read()` unblocks
+
+File: `sw/drivers/wren-core.c`, function `wren_usr_read()` (line 119)
+
+The userspace process was sleeping in `wait_event_interruptible_locked(&client->wqh, ...)`.
+The `wake_up()` from Stage 2 makes it runnable. After the Linux scheduler
+context-switches to it (~5-30 µs depending on load and RT priority), it:
+
+1. Reads the message header from `client->ring[ring_head]`
+2. Extracts `buf_idx` from the atomic `buf_cmd` field
+3. Copies the capsule header, timestamp, config ID, and source index
+   from the kernel buffer to userspace via `put_user()`
+4. Advances `ring_head`
+5. Decrements the buffer refcount; returns buffer to pool if zero
+
+| Mechanism | Latency |
+|-----------|---------|
+| Context switch + `put_user()` copy | 5-30 µs |
+
+### Stage 4: Userspace C library — message decode
+
+File: `sw/api/wrenrx-drv-wren.c`, function `wren_drv_wait()` (line 1485)
+
+`wren_drv_wait()` loops on `read(h->wren_fd, ...)`. When `read()` returns data,
+it dispatches on `u.hdr.hdr.typ`:
+
+- `CMD_ASYNC_PULSE` → `wren_drv_read_pulse()` decodes the raw words into a
+  `struct wrenrx_msg` with `.kind = wrenrx_msg_pulse`, populating config ID,
+  timestamp, and (for event-bound triggers) the load event's fields and context.
+- `CMD_ASYNC_CONTEXT` → delivered immediately.
+- `CMD_ASYNC_EVENT` → enters the software event scheduler: computes delivery time
+  (due-time minus subscription offset), inserts into a sorted linked list, and
+  sets a kernel timer via `WREN_IOC_RX_SET_TIMEOUT`. The event is returned to
+  userspace only when the timer expires and `read()` returns `-ETIME`.
+
+| Mechanism | Latency |
+|-----------|---------|
+| Capsule decode + message construction | 1-5 µs |
+
+### Stage 5: C++ framework — `WrenReceiver` event construction
+
+Files: `timing-receiver-wren/src/timing-receiver-wren/WrenRxHandle.cpp` (line 457),
+`timing-receiver-wren/src/timing-receiver-wren/WrenReceiver.cpp` (line 237)
+
+`WrenRxHandle::waitForMessage()` wraps the C `wrenrx_wait2()` call, converting
+the `wrenrx_msg` into a `WrenMessage` with type `TRIGGER`, `EVENT`, or `CONTEXT`.
+
+`WrenReceiver::waitContextOrEventNoRetry()` processes the message:
+- For TRIGGER: matches config ID to the trigger name via the action map,
+  extracts the load event ID and fields (for event-bound triggers), merges
+  with cached context fields, and constructs a `timing::Event` object.
+- For CONTEXT: decodes the TLV-encoded fields and stores in the context cache
+  (boost::multi_index_container, up to 4 per domain).
+- For EVENT: creates an `Event` from the descriptor + cached context.
+
+The application calls `receiver->waitEvent()` which loops until an Event
+(or Context, depending on subscription) is available.
+
+| Mechanism | Latency |
+|-----------|---------|
+| WrenMessage wrap + Event construction + context merge | 5-10 µs |
+
+### Total end-to-end latency (LTIM pulse → userspace application)
+
+| Stage | Latency (typical) | Latency (worst-case) |
+|-------|--------------------|----------------------|
+| 1. R5 firmware | 1-5 µs | 10 µs |
+| 2. Kernel IRQ handler + wake_up | 5-15 µs | 25 µs |
+| 3. Context switch + read() copy | 5-30 µs | 50 µs |
+| 4. C library decode | 1-5 µs | 5 µs |
+| 5. C++ Event construction | 5-10 µs | 10 µs |
+| **Total** | **15-60 µs** | **~100 µs** |
+
+### Why this design — not DMA, not busy-polling
+
+The WREN's "nanosecond precision" claim is about the **FPGA output pin** —
+the pulser drives the LEMO connector at the exact scheduled TAI time, verified
+to sub-nanosecond accuracy against the White Rabbit grandmaster clock. The
+hardware timing path (WR network → FPGA gateware → pulser → LEMO cable) has
+no software involvement.
+
+The software path is intentionally conservative because:
+
+1. **Events arrive seconds in advance.** Scheduled CTIMs are delivered ~3.6
+   seconds before their due-time. Software being notified 50 µs "late" is
+   irrelevant with seconds of margin. The delivery offset mechanism (-5s to
+   +5s, µs precision) provides additional scheduling control.
+
+2. **The timing action is in hardware.** For LTIMs, the FPGA fires the output
+   pin at the correct nanosecond. The software notification exists for
+   logging, diagnostics, and non-timing-critical auxiliary actions — not
+   for the primary timing output.
+
+3. **FESA adds orders of magnitude more latency.** Even if the kernel path
+   took 2 µs, the FESA real-time scheduler adds ~1.28 ms. Optimizing a
+   50 µs kernel path that feeds into a 1280 µs scheduler is diminishing returns.
+
+4. **Reliability beats latency.** `wait_event_interruptible()` + blocking
+   `read()` is the most battle-tested IPC mechanism in the Linux kernel.
+   No mmap cache-coherence bugs, no DMA descriptor races, no cache-line
+   stomping on ARM. The 64-client fan-out with lock-free ring buffers
+   and reference-counted buffer pools is proven in production accelerator
+   complexes running 24/7 for years.
+
+5. **The hardware data path doesn't support it.** As verified during the
+   PCIe DMA investigation (2026-05-01), neither the egress engine's AXI
+   slave port nor the scatter-gather DMA engine's M_AXI_SG port is
+   connected in the current FPGA build. Device→host DMA or posted-write
+   push is not possible without an FPGA rebuild.
+
+### Kernel MMIO: exactly the same mechanism as our sidecar
+
+The kernel driver reads the async ring buffer using `ioread32()`, which on x86
+compiles to a plain `volatile uint32_t` load — identical to what our sidecar
+does. The evidence from `sw/drivers/wren-core.c`:
+
+Reading ring pointers (lines 359-360):
+```c
+b_off = ioread32(&mb->async_board_off);   // BAR1 MMIO read
+h_off = ioread32(&mb->async_host_off);    // BAR1 MMIO read
+```
+
+Reading capsule header (line 4215):
+```c
+hdr.u32 = ioread32(&mb->async_data[h_off]); // BAR1 MMIO read
+```
+
+Reading each capsule data word (line 440):
+```c
+data = ioread32(&mb->async_data[h_off]);    // BAR1 MMIO read
+```
+
+The kernel does 5-8 `ioread32()` calls per capsule (header + 3-4 data words
++ pointer reads). Each is a ~1.3 µs PCIe read round-trip on mkdev30. That's
+~8-12 µs of PCIe reads per event, before any scheduling overhead.
+
+The kernel then copies the data to userspace via `put_user()` — an additional
+copy that our sidecar doesn't need. Userspace never does its own MMIO; it
+simply calls `read()` on `/dev/wren`, which blocks in `wait_event_interruptible_locked()`
+(line 156) until the kernel's IRQ thread has done all the work.
+
+### Sidecar: how we beat this
+
+Our ABTWREN sidecar bypasses the entire kernel/userspace chain by reading
+the async ring buffer directly via PCIe BAR1 MMIO from a busy-polling thread
+on an isolated CPU core at `SCHED_FIFO` priority. Same `ioread32`/`volatile`
+mechanism, but without the kernel's IRQ threading, scheduler, and copy overhead:
+
+| Component | Kernel path | Sidecar path |
+|-----------|-------------|--------------|
+| Detection mechanism | MSI interrupt → IRQ_WAKE_THREAD → threaded handler | Busy-poll `volatile` read |
+| `board_off` read | `ioread32()` in IRQ thread | `volatile` load in userspace |
+| Capsule reads | `ioread32()` × 4-5 in IRQ thread | `volatile` load × 4-5 in userspace |
+| Data path to consumer | `put_user()` copy to userspace | Direct read from BAR1 mmap |
+| Scheduling | `wait_event_interruptible_locked()` context switch | None — pinned core, SCHED_FIFO |
+| **Total detection** | **15-60 µs** | **~2.6 µs** |
+
+| Approach | Detection latency |
+|----------|-------------------|
+| Official path (kernel `read()`) | 15-60 µs |
+| Sidecar (BAR1 MMIO busy-poll) | ~2.6 µs |
+
+The sidecar reads `async_board_off` from BAR1+0x14000 and processes capsules
+directly from BAR1+0x12000 — no interrupts, no context switches, no copies.
+The kernel driver continues to operate normally alongside it for FESA/wrentest.
+
 ## Async Ring Buffer Detail (what the sidecar reads)
 
 ```
@@ -549,8 +765,9 @@ BAR1 + 0x14004: async_host_off       (driver read pointer — NEVER touch)
 
 Capsule header (1 word):
 ```
-bits [7:0]   = typ          (0x01=context, 0x02=event, 0x04=pulse, 0x07=continuation)
-bits [15:8]  = source_idx   (RX source index)
+bits [7:0]   = typ          (0x01=context, 0x02=event, 0x03=config, 0x04=pulse,
+                             0x07=continuation, 0x08=rel_act)
+bits [15:8]  = source_idx   (RX source index, 0xff for config)
 bits [31:16] = len          (total words including header)
 ```
 
@@ -575,16 +792,283 @@ word 4+: params    (TLV-encoded fields)
 Pulse capsule (typ=0x04):
 ```
 word 0: header     {typ=0x04, source_idx, len}
-word 1: comp_idx   (comparator/action index)
-word 2: ts.nsec    (pulse execution timestamp)
-word 3: ts.sec
+word 1: comp_idx   (sw_comparator index, from comp_map[])
+word 2: tai        (pulse execution seconds, from tm_tai_lo)
+word 3: ts         (pulse execution cycles, 30-bit from pulser FIFO)
 ```
+Note: PULSE word order (sec, nsec) is OPPOSITE to EVENT (nsec, sec).
+This is because EVENT copies from `wren_packet_ts` {nsec, sec} while
+PULSE copies from the hardware pulser FIFO {tm_tai, tm_cyc}.
+Verified in `wrenrx-cmd.c` `pulses_handler()` lines 1867-1868.
 
 **The ring buffer only contains events the kernel driver has subscribed to.**
 Firmware checks `evsubs[event_id] > 0` before writing to the ring.
 
 **Wire and async formats are identical for capsules** — only the delivery mechanism
 differs (Ethernet frame vs shared-memory ring buffer).
+
+---
+
+## PCIe Architecture
+
+The WREN uses a Xilinx AXI PCIe Bridge IP core (PG194/PG195). The Zynq
+UltraScale+ PS-side PCIe controller connects to the PL-side bridge, which
+provides BAR mapping, ingress/egress translation windows, and a scatter-gather
+DMA engine.
+
+### BAR Layout
+
+| BAR | Size | Host label | Maps to | Purpose |
+|-----|------|------------|---------|---------|
+| BAR0 | 64 KB | `WREN_PSPCIE_BAR` | Bridge regs + DMA + ingress/egress | AXI bridge control, DMA engine at offset 0x0000, ingress engines at 0x8800, egress at 0x8C00 |
+| BAR1 | 256 KB | `WREN_REGS_BAR` | PL_MAP_BASE + BTCM | `host_map` registers (0x0000–0x2000), WRPC RAM (0x1000), mailbox (0x10000–0x14000), async ring (0x12000–0x14000) |
+| BAR2 | 64 KB | — | OCM (0xfffc0000) | On-chip memory, R5-accessible |
+| BAR3 | 2 MB | — | DDR | Device DRAM window |
+| BAR4 | 64 KB | — | QSPI (0x00FF0F0000) | Flash memory window |
+
+### Ingress vs Egress
+
+- **Ingress**: Host-initiated. Translates a PCIe BAR address → device AXI address.
+  The 8 ingress engines (at BAR0+0x8800) are what make BAR1–BAR4 work.
+  Configured once at boot by R5 firmware.
+
+- **Egress**: Device-initiated. Translates a device AXI address → host PCIe address.
+  The egress engines (at BAR0+0x8C00) enable the WREN to perform PCIe bus-master
+  writes into host RAM. **Currently unused** but fully configured by the R5.
+
+### Scatter-Gather DMA Engine
+
+**Location**: BAR0 offset 0x0000 per channel (4 channels: 0 at +0x00, 1 at
++0x80, 2 at +0x100, 3 at +0x180). AXI address `0xFD0F_0000` (PCIe DMA).
+Documented in UG1085 Chapter 30. Mapped by the kernel driver as `wren->psdma`.
+
+**Current state: completely unused for data transfer.** The firmware
+(`pcie-core.c`) maps the DMA register aperture (`dreg_base`) and enables the
+PCIe interrupt line, but never configures a DMA channel. The kernel driver
+only reads `pcie_interrupt_status` for software-generated interrupts
+(bit 3, `XPCIE_SOFTWARE_INT`). The scratchpad registers (offset +0x60) are
+used for host↔R5 handshake communication.
+
+#### Register map (per channel, 128 bytes)
+
+| Offset | Register | Description |
+|--------|----------|-------------|
+| 0x00 | SRC_Q_PTR_LO/HI | Source queue base address (PCIe address of descriptors) |
+| 0x08 | SRC_Q_SIZE | Source queue size (number of SGL elements) |
+| 0x0C | SRC_Q_LIMIT | Index of first element owned by software; DMA wraps here |
+| 0x10 | DST_Q_PTR_LO/HI | Destination queue base address |
+| 0x18 | DST_Q_SIZE | Destination queue size |
+| 0x1C | DST_Q_LIMIT | Destination queue limit |
+| 0x20 | STAS_Q_PTR_LO/HI | Source status queue base address |
+| 0x30 | STAD_Q_PTR_LO/HI | Destination status queue base address |
+| 0x40 | SRC_Q_NEXT | Source queue next pointer (init to 0, DMA advances) |
+| 0x44 | DST_Q_NEXT | Destination queue next pointer |
+| 0x48 | STAS_Q_NEXT | Source status queue next pointer |
+| 0x4C | STAD_Q_NEXT | Destination status queue next (init to 0, write-only) |
+| 0x60 | SCRATCH0–3 | Scratchpad registers (R5 ↔ host communication) |
+| 0x70 | PCIE_INTERRUPT_CONTROL | PCIe interrupt mask |
+| 0x78 | DMA_CONTROL | Channel enable/disable (bit 0 = enable) |
+| 0x7C | DMA_STATUS | Channel status (bit 0 = running, bit 15 = channel present) |
+
+#### SGL-Q descriptor format (128-bit entries, UG1085 §30.4)
+
+No linked-list pointers. Queues are linear arrays with wrap at Q_SIZE.
+Elements are 128 bits:
+
+```
+SRC-Q element:
+  [63:0]   Source address (AXI or PCIe)
+  [87:64]  Byte count (0 = 2^24 bytes)
+  [95:88]  Flags: bit[0]=Location (1=AXI, 0=PCIe), bit[1]=EOP, bit[2]=Interrupt
+  [111:96] UserHandle (copied to status Q on EOP)
+  [127:112] UserID (copied to status Q)
+
+DST-Q element:
+  [63:0]   Destination address
+  [87:64]  Byte count
+  [95:88]  Flags: bit[0]=Location (1=AXI dest, 0=PCIe dest)
+  [111:96] UserHandle
+
+Status-Q element (32 or 64-bit):
+  [0]      Completed   [1] SRC error   [2] DST error   [3] Internal error
+  [30:4]   Completed byte count
+```
+
+#### C2S (Card-to-System / Device→Host) flow
+
+Per UG1085 for single-CPU control:
+
+1. SRC-Q elements: AXI buffer addresses (device memory)
+2. DST-Q elements: PCIe buffer addresses (host RAM)
+3. Status Q elements: in host RAM
+4. Q descriptors are fetched **over PCIe** (must be in host-accessible memory)
+5. DMA reads source data over AXI, writes to host via PCIe Memory Write TLPs
+6. Status written on EOP
+
+#### Initialization sequence (UG1085 §30.4.5)
+
+1. Verify idle: read DMA_STATUS[running] == 0
+2. Write Q_PTR_LO/HI for all four queues
+3. Write Q_SIZE for all queues
+4. Write Q_NEXT = 0 for all queues
+5. Write SRC/DST_Q_LIMIT = 0 (empty), STAS/STAD_Q_LIMIT = SIZE-1
+6. Initialize status Q elements to 0
+7. Advance SRC/DST_Q_LIMIT to hand elements to DMA
+8. Write DMA_CONTROL = 1 (enable)
+
+Only Q_LIMIT registers may be modified while running.
+
+#### DMA engine investigation (2026-05-01)
+
+An exhaustive test campaign was conducted on mkdev30 attempting every
+combination of descriptor placement, programming side, and initialization
+sequence:
+
+| Variation | Result |
+|-----------|--------|
+| Descriptors in OCM, programmed from host | SRC_NEXT=0 |
+| Descriptors in DDR, programmed from host | SRC_NEXT=0 |
+| Descriptors in host RAM, programmed from host | SRC_NEXT=0 |
+| SRC/STAS from R5 via CMD_WRITE, DST/STAD from host | SRC_NEXT=0 |
+| All registers from R5 via CMD_WRITE | SRC_NEXT=0 |
+| Q_PTR_HI correct for >4 GB addresses, cache flushed | SRC_NEXT=0 |
+| Various dma_control bit patterns | SRC_NEXT=0 |
+| `axi_master` bits 0-2 set, `cfg_disable_pcie_dma_reg_access`=0 verified | SRC_NEXT=0 |
+
+Every configuration gives identical behavior: DMA_STATUS = 0x8001 (bit 15 =
+channel present, bit 0 = running), SRC_NEXT stays at 0 regardless of Q_LIMIT.
+The channel accepts the enable command but never reads a single descriptor.
+
+**Conclusion: the DMA scatter-gather data path is not functional in the current
+FPGA build.** The registers are accessible and the channel accepts the enable
+command, but the internal AXI datapaths needed to read descriptors and move
+data were never connected in the Vivado block design. The WREN firmware only
+uses the DMA IP for scratchpad registers and software interrupts — no DMA data
+transfers are ever configured.
+
+The egress engine has the same issue: its AXI slave port is not wired in the
+PL block design, verified by confirming no PS→PL address routes into the
+bridge's slave port. Both features require Vivado block design changes and an
+FPGA bitstream rebuild by the WREN hardware team (BE-CEM).
+
+#### Key documents
+
+| Document | Content |
+|----------|---------|
+| UG1085 Ch30 | Zynq PS PCIe controller: DMA SGL-Q format, init sequence, C2S flow |
+| UG1085 Ch10 | PS-PL register map (0xFD0F_0000 = PCIe DMA, 0xFD0E_0000 = bridge) |
+| PG195 v4.1 | PL-based DMA/Bridge Subsystem IP (different IP, Magic=0xAD4B descriptors) |
+| UG1087 | Zynq Register Reference (per-field bit descriptions) |
+| `xpcie.h` | WREN firmware's DMA register struct, matches UG1085 layout |
+
+### Sub-microsecond path: hot-patch the firmware, no source changes needed
+
+The R5 firmware already exposes two powerful mailbox commands:
+
+| Command | ID | Purpose |
+|---------|----|---------|
+| `CMD_WRITE` | 1 | Writes 32-bit words to any R5-accessible address |
+| `CMD_EXEC` | 3 | Calls a function at any R5-accessible address |
+
+**PL-PS address map limitation:** The PL can reach DDR (0x00000000), FPD
+peripherals (0xFD000000-0xFDFFFFFF), and QSPI (0xC0000000). It cannot reach
+PS LPD registers like CRL_APB (0xFF5E0000). However, the R5 can access
+CRL_APB natively. This means `CMD_WRITE` to address `0xFF5E0218` with value
+`0x10` triggers an R5 soft-reset — the same mechanism the firmware's own
+`propagate_reset()` uses.
+
+Combined, these primitives enable a firmware hot-patch workflow with zero
+permanent changes:
+
+```
+1. Read firmware binary     CMD_READ from 0xFFFE0000 (OCM where code lives)
+                            → exact ARM/Thumb machine code the R5 runs
+
+2. Find injection point     disassemble, locate the store instruction that
+                            bumps async_board_off after writing a capsule
+
+3. Write stub to DDR        mmap BAR3, write ARM stub code:
+                              • executes original async_board_off store
+                              • writes to DMA_CONTROL to kick a transfer
+                              • returns to main loop
+
+4. Atomically patch         Send CMD_WRITE: overwrite one BL instruction
+                            in OCM with a branch to our DDR stub
+
+5. Result (requires         firmware writes capsule, bumps board_off,
+   FPGA rebuild for HW      triggers DMA → host polls completion in L1
+   data path)               cache at ~1 ns. FESA/wrentest unchanged.
+```
+
+**Note:** The egress engine's AXI slave port and the DMA engine's
+scatter-gather master are not connected in the current FPGA build.
+The hot-patch injection mechanism (steps 1–4) is fully operational,
+but the hardware data path to push data to host RAM requires Vivado
+block design changes.
+
+**Safety:** Every change lives in volatile memory.
+- OCM patch: lost on power-cycle
+- DDR stub: lost on power-cycle
+- Power-cycle → original QSPI firmware boots → factory state
+
+**Expected end-to-end latency** (LTIM pulse on FPGA → host action):
+
+| Step | Latency |
+|------|---------|
+| FPGA pulser fires → R5 interrupt | 1-5 µs |
+| Firmware writes capsule + bumps board_off | ~100 ns |
+| Host polls board_off via BAR1 MMIO read | ~1300 ns |
+| Host reads capsule via BAR1 MMIO | ~1300 ns |
+| **Total detection (current MMIO poll)** | **~2.6 µs** |
+| **End-to-end (FPGA fire → host action)** | **~4-8 µs** |
+
+The ~1300 ns poll cost is the PCIe read round-trip floor — a hardware
+constraint of the current FPGA build. The egress engine's AXI slave port and
+the DMA engine's scatter-gather master are not connected. Breaking below
+~1300 ns would require either:
+
+1. Connecting the egress engine's S_AXI port in the Vivado block design
+2. Connecting the DMA engine's M_AXI_SG port in the Vivado block design
+3. A custom VHDL module that writes directly to PCIe on pulser fire
+
+Options 1-2 are VHDL/block design changes. Option 3 bypasses the R5
+entirely (FPGA writes directly to PCIe posted-write → host L1 cache in
+~100 ns).
+
+### Custom firmware: full replacement path
+
+For deeper changes (new mailbox commands, altered scheduling, DMA descriptor
+programming), a complete firmware replacement can be tested without flashing
+QSPI:
+
+```
+1. Write new firmware to DDR     mmap BAR3, write firmware binary
+
+2. Patch BTCM reset vector       mmap BAR1, overwrite first 32 bytes at
+                                 offset 0x10000 → reset vector points to
+                                 DDR bootloader. Safe: exceptions go to
+                                 0xFFFF0000 (HIVECS), not BTCM base.
+
+3. Trigger R5 soft-reset        Send CMD_WRITE: address=0xFF5E0218, value=0x10
+                                 R5 resets → boots DDR firmware
+
+4. Recovery                     Power-cycle → QSPI firmware restored
+```
+
+**R5 BTCM at BAR1+0x10000** — 64 KB R5 program/data memory, readable and
+writable via PCIe. The kernel driver already loads the RISC-V WRPC firmware
+this way (`wrc.elf` to BAR1+0x1000 at boot).
+
+**QSPI flash at BAR4** — 64 KB window into the boot flash. Only write here
+once the firmware is fully validated via DDR/BTCM testing.
+
+**MicroUSB** — UART serial console. The R5 firmware has a CLI (`main_loop`
+polls `uart_can_read`). Recovery path if PCIe-based reflashing goes wrong.
+
+**Risk on shared hardware:** mkdev30 is a shared CERN test machine. The
+hot-patch approach (egress stub in DDR) is zero-risk — nothing survives
+power-cycle. Full firmware replacement via BTCM/DDR is also safe as long as
+QSPI is not touched. QSPI flashing requires WREN team (BE-CEM) approval.
 
 ---
 
@@ -778,3 +1262,45 @@ async ring at +0x2000, async pointers at +0x4000.
 
 Kernel team recompiling all 17 failed modules for `5.10.245-rt139-fecos03`.
 Once `wren-core.ko` and `wren-pcie.ko` load, the standard boot sequence works end-to-end.
+
+---
+
+## Firmware Audit Checklist (for manual verification)
+
+All files live under `/opt/public/FESA_core_repos/WREN_LTIM/wren-gw/sw/`.
+
+### The 4 files that matter for the sidecar
+
+| What to check | File | What breaks if it changes |
+|----------------|------|---------------------------|
+| **Host register offsets** (IDENT, WR_STATE, TAI, ISR, etc.) | `hw-include/host_map.h` | `performRegisterDump()`, all PCIe reads |
+| **Async ring layout** (data array size, board_off/host_off) | `hw-include/mb_map.h` | `RING_MASK`, `WREN_ASYNC_*` offsets |
+| **Capsule type codes + header format** (TYP_*, CMD_ASYNC_*) | `hw-include/wren-mb-defs.h` | `transmitAll()` switch cases |
+| **Capsule word layouts** (how EVENT/PULSE/CONFIG are written) | `firmware/common/wrenrx-cmd.c` | sec/nsec order, field extraction |
+
+### How to audit `wrenrx-cmd.c`
+
+Search for these functions — each one writes a capsule type to the async ring:
+
+| Capsule | Function | Lines to check |
+|---------|----------|----------------|
+| EVENT | `wrenrx_run_event()` | `async_write32` sequence for ev_id, nsec, sec |
+| PULSE | `pulses_handler()` | `async_write32` sequence for comp_map, tai, ts |
+| CONFIG | `async_send_config()` | `async_write32` sequence for act_idx, sw_cmp_idx |
+| CONTEXT | `wrenrx_run_context()` | `async_write32` sequence for ctxt_id, nsec, sec |
+| REL_ACT | `cmd_rx_del_action()` | 2-word capsule, only carries action index |
+
+### Secondary files (good to skim)
+
+- `hw-include/wren-mb-cmds.def` — mailbox command enum (new commands added?)
+- `hw-include/pulser_group_map.h` — pulser hardware register layout
+- `api/include/wren/wren-common.h` — `WREN_ETHERTYPE`, `MAX_RX_ACTIONS`, `WREN_EVENT_ID_MAX`
+- `api/include/wren/wren-packet.h` — wire capsule structs (`wren_capsule_hdr`, `wren_packet_ts`)
+- `api/include/wren/wren-hw.h` — pulser/group counts (`WREN_NBR_PULSERS`, `WREN_NBR_COMPARATORS`)
+- `firmware/common/wrenrx-data.h` — `MAX_RX_ACTIONS`, `MAX_RX_SOURCES`, `MAX_RX_CONDS`
+
+### Last verified
+
+2026-04-24: All register offsets, capsule formats, type codes, and word ordering
+match between firmware headers and `WRENProtocol.hpp` / `WRENTransmitter.cpp`.
+New type `CMD_ASYNC_REL_ACT (0x08)` exists; handled safely by `default: break;`.

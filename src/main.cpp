@@ -155,8 +155,7 @@ static void runTransmitter() {
     std::printf("[TX] WREN sidecar transmitter on %s (core %d)\n", kInterface, kCpuCore);
     std::printf("[TX] Watchdog: auto-shutdown in %d seconds\n", kWatchdogSec);
 
-    // NicTuner for TX lives here (stack-allocated, destructor restores settings)
-    NicTuner tuner(kInterface, kCpuCore);
+    NicTuner tuner(kInterface, kCpuCore, NicTunerMode::Full);
     applyTxSystemTuning();
     spawnTxWatchdog();
 
@@ -169,10 +168,10 @@ static void runTransmitter() {
     tx_cfg.packetVersion = TPACKET_V2;
     tx_cfg.qdiscBypass   = true;
 
-    WRENTransmitter transmitter(WREN_VENDOR_ID, WREN_DEVICE_ID, WREN_BAR, tx_cfg);
-    transmitter.setMacAddresses(kTxMac, kRxMac);  // src=mkdev30, dst=mkdev16
+    PacketMmapTx ethernetSocket(tx_cfg);
+    WRENTransmitter transmitter(WREN_VENDOR_ID, WREN_DEVICE_ID, WREN_BAR, ethernetSocket);
+    transmitter.setMacAddresses(kTxMac, kRxMac);
 
-    // Configure 0-offset CTIM fire actions via PCIe mailbox.
     WRENCTIMConfigurator ctimConfig(transmitter.pcie(), {
         {142, 24},  // PIX.AMCLO-CT  → pulser 24
         {143, 25},  // PIX.F900-CT   → pulser 25
@@ -196,16 +195,28 @@ static void runReceiver() {
                 kInterface, kPollerCore, kProcessorCore);
     std::printf("[RX] Watchdog: auto-shutdown in %d seconds\n", kWatchdogSec);
 
+    RingConfig rx_cfg{};
+    rx_cfg.interface     = kInterface;
+    rx_cfg.direction     = RingDirection::RX;
+    rx_cfg.blockSize     = kBlockSize;
+    rx_cfg.blockNumber   = kBlockNumber;
+    rx_cfg.protocol      = kEtherType;
+    rx_cfg.hwTimeStamp   = false;
+
+    PacketMmapRx ethernetSocket(rx_cfg);
+
     if constexpr (UseQueue) {
         rigtorp::SPSCQueue<TimingEvent> queue(kQueueCapacity);
         QueueSink sink(queue);
         EventProcessor processor(kShmName, queue);
-        MainReceiver<QueueSink> receiver(kInterface, kPollerCore, sink, &processor, kProcessorCore);
+        MainReceiver<PacketMmapRx, QueueSink> receiver(
+            kInterface, kPollerCore, ethernetSocket, sink, &processor, kProcessorCore);
         runUntillSignal(receiver);
     }
     else {
         ShmSink sink(kShmName);
-        MainReceiver<ShmSink> receiver(kInterface, kPollerCore, sink);
+        MainReceiver<PacketMmapRx, ShmSink> receiver(
+            kInterface, kPollerCore, ethernetSocket, sink);
         runUntillSignal(receiver);
     }
 }
