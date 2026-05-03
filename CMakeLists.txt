@@ -22,7 +22,13 @@ FetchContent_Declare(
     GIT_TAG        master
 )
 
-FetchContent_MakeAvailable(ABTEdge ABTRDA3 SPSCQueue)
+FetchContent_Declare(
+    tomlplusplus
+    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    GIT_TAG        v3.4.0
+)
+
+FetchContent_MakeAvailable(ABTEdge ABTRDA3 SPSCQueue tomlplusplus)
 
 # ── Compiler flags ────────────────────────────────────────────────
 add_library(abtwren_flags INTERFACE)
@@ -32,18 +38,34 @@ target_compile_options(abtwren_flags INTERFACE
     -Wno-interference-size   # suppress GCC warning from rigtorp/SPSCQueue.h
 )
 
+# ── Architecture-specific tuning ───────────────────────────────────
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-    target_compile_options(abtwren_flags INTERFACE -march=native)
+    target_compile_options(abtwren_flags INTERFACE -march=native -mtune=native)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    target_compile_options(abtwren_flags INTERFACE -march=armv8-a)
+    # Zynq UltraScale+ Cortex-A53 — ARMv8.0-A with crypto
+    target_compile_options(abtwren_flags INTERFACE -mcpu=cortex-a53 -mtune=cortex-a53)
 endif()
+
+# ── Release: maximal optimisations for lowest latency ───────────────
 
 target_compile_options(abtwren_flags INTERFACE
     $<$<CONFIG:Release>:-O3 -flto -fno-exceptions -DNDEBUG>
-    $<$<CONFIG:Debug>:-O0 -g3 -fno-omit-frame-pointer>
+    $<$<CONFIG:Release>:-fno-plt -fno-semantic-interposition>
+    $<$<CONFIG:Release>:-falign-functions=64 -falign-loops=64>
+    $<$<CONFIG:Release>:-fno-math-errno -fno-trapping-math>
+    $<$<CONFIG:Release>:-ffunction-sections -fdata-sections>
 )
 target_link_options(abtwren_flags INTERFACE
     $<$<CONFIG:Release>:-flto>
+    $<$<CONFIG:Release>:-Wl,-z,now -Wl,--gc-sections>
+    $<$<CONFIG:Release>:-Wl,-O3 -Wl,--hash-style=gnu>
+)
+
+# ── Debug: no optimisation, frame pointers for profiling ────────────
+
+target_compile_options(abtwren_flags INTERFACE
+    $<$<CONFIG:Debug>:-O0 -g3 -fno-omit-frame-pointer>
 )
 
 # ── Include paths for subdirectories ──────────────────────────────
@@ -56,7 +78,6 @@ set(ABTWREN_INCLUDE_DIRS
 
 # ── WREN Transmitter library ─────────────────────────────────────
 add_library(wren_transmitter STATIC
-    src/WREN/WRENTransmitter.cpp
     src/WREN/WRENCTIMConfigurator.cpp
 )
 
@@ -90,7 +111,7 @@ add_executable(abtwren src/main.cpp)
 target_include_directories(abtwren PRIVATE ${ABTWREN_INCLUDE_DIRS})
 
 target_link_libraries(abtwren
-    PRIVATE wren_transmitter wren_receiver abtwren_flags fmt::fmt
+    PRIVATE wren_transmitter wren_receiver abtwren_flags fmt::fmt tomlplusplus::tomlplusplus
 )
 
 if(ABTWREN_USE_QUEUE)

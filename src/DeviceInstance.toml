@@ -1,18 +1,40 @@
+# ABTWREN Sidecar Timing Distribution Configuration
+#
+# Transmitter (mkdev30): reads WREN PCIe ring, forwards events via transport
+# Receiver    (mkdev16): receives events via transport, two-thread SPSC arch
+#
+# Valid transports: "packet_mmap" | "af_xdp" | "intel_i210" | "cadence_gem"
 
-# TODO: Transmitter
-# WREN: Vendor ID, Device ID
-# Transport type: packet_mmap, AF_XDP, Intel_i210, candence_gem
-# Interface: eno1, eth0, end0 etc
-# Mac address:
-# Driver: macb or igb otherwise leave blank for packet_mmap/AF_XDP
-# CPU core: 0,1,2,3. This is the core where you apply the NIC tuner
+[general]
+ether_type   = 0x88B5
+watchdog_sec = 30
 
-# TODO: Reciever
-# Transport type: packet_mmap, AF_XDP, Intel_i210, candence_gem
-# Interface: eno1, eth0, end0 etc
-# Mac address:
-# Driver: macb or igb otherwise leave blank for packet_mmap/AF_XDP
-# CPU core: 0,1,2,3. This is the core where you apply the NIC tuner
+[transmitter]
+transport = "packet_mmap"
+interface = "eno2"
+driver    = ""
+mac       = "d4:f5:27:2a:a9:59"   # cfc-865-mkdev30 eno2
+cpu_core  = 4
 
-# TODO: Safety watchdog
-# Enter seconds of how long the watchdog should be 
+[receiver]
+transport      = "packet_mmap"
+interface      = "eno2"
+driver         = ""
+mac            = "20:87:56:b6:33:67"   # cfc-865-mkdev16 eno2
+poller_core    = 4
+processor_core = 5
+queue_capacity = 4096
+
+[packet_mmap]
+block_size   = 4096
+block_number = 64
+
+[af_xdp]
+umem_frame_size = 4096
+frame_count     = 64
+need_wakeup     = true
+
+# ── MAC reference ─────────────────────────────────────────────────────────
+# mkdev16: eno1=20:87:56:b6:6a:27  eno2=20:87:56:b6:33:67  eno3=20:87:56:b6:33:68
+# mkdev30: eno1=d4:f5:27:2a:69:f1  eno2=d4:f5:27:2a:a9:59  eno3=d4:f5:27:2a:a9:58
+# mkdev50: end0=fc:0f:e7:1b:8b:55
