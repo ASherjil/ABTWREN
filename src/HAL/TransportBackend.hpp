@@ -156,7 +156,7 @@ int runTransmitterWith(Tx& tx, const SidecarConfig& cfg) {
                 cfg.tx.interface.c_str(), cfg.tx.cpuCore);
     std::printf("[TX] Watchdog: auto-shutdown in %d seconds\n", cfg.watchdogSec);
 
-    NicTuner tuner(cfg.tx.interface.c_str(), cfg.tx.cpuCore, NicTunerMode::Full);
+    NicTuner tuner(cfg.tx.interface.c_str(), cfg.tx.cpuCore, cfg.nicTunerMode);
     applyTxSystemTuning();
     spawnTxWatchdog(cfg.watchdogSec);
 
@@ -185,7 +185,7 @@ int runReceiverWith(Rx& rx, const SidecarConfig& cfg) {
                 cfg.rx.interface.c_str(), cfg.rx.pollerCore, cfg.rx.processorCore);
     std::printf("[RX] Watchdog: auto-shutdown in %d seconds\n", cfg.watchdogSec);
 
-    NicTuner tuner(cfg.rx.interface.c_str(), cfg.rx.pollerCore, NicTunerMode::Full);
+    NicTuner tuner(cfg.rx.interface.c_str(), cfg.rx.pollerCore, cfg.nicTunerMode);
 
 #ifdef ABTWREN_USE_QUEUE
     rigtorp::SPSCQueue<TimingEvent> queue(cfg.rx.queueCapacity);

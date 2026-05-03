@@ -8,6 +8,7 @@
 [general]
 ether_type   = 0x88B5
 watchdog_sec = 30
+nic_tuner    = "full"               # "off" | "nfs_safe" | "full"
 
 [transmitter]
 transport = "packet_mmap"
@@ -23,7 +24,7 @@ driver         = ""
 mac            = "20:87:56:b6:33:67"   # cfc-865-mkdev16 eno2
 poller_core    = 4
 processor_core = 5
-queue_capacity = 4096
+queue_capacity = 32
 
 [packet_mmap]
 block_size   = 4096

@@ -83,6 +83,7 @@ inline void WRENReceiver<Rx, Sink>::parseAndEnqueue(const RxFrame& frame) {
         return;
     }
 
+    // Todo: Add another sink for the DIOT testing so it can generate a square pulse based on a specific LTIM 
     m_sink.push(ev);
 }
 

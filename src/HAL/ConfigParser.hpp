@@ -5,6 +5,7 @@
 #ifndef ABTWREN_CONFIGPARSER_HPP
 #define ABTWREN_CONFIGPARSER_HPP
 
+#include <NicTuner.hpp>
 #include <toml++/toml.hpp>
 
 #include <array>
@@ -17,6 +18,7 @@ struct SidecarConfig {
     // [general]
     std::uint16_t etherType   = 0x88B5;
     int           watchdogSec = 30;
+    NicTunerMode  nicTunerMode = NicTunerMode::Full;
 
     // [transmitter]
     struct Tx {
@@ -68,6 +70,11 @@ inline SidecarConfig loadConfig(const char* path) {
     // [general]
     cfg.etherType   = static_cast<std::uint16_t>(tbl["general"]["ether_type"].value_or(0x88B5));
     cfg.watchdogSec = tbl["general"]["watchdog_sec"].value_or(30);
+
+    const auto nicTunerStr = tbl["general"]["nic_tuner"].value_or(std::string{"full"});
+    if      (nicTunerStr == "off")      cfg.nicTunerMode = NicTunerMode::Off;
+    else if (nicTunerStr == "nfs_safe") cfg.nicTunerMode = NicTunerMode::NfsSafe;
+    else                                cfg.nicTunerMode = NicTunerMode::Full;
 
     // [transmitter]
     using namespace std::string_literals;
