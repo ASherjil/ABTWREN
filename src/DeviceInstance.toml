@@ -8,23 +8,27 @@
 [general]
 ether_type   = 0x88B5
 watchdog_sec = 30
-nic_tuner    = "full"               # "off" | "nfs_safe" | "full"
+nic_tuner    = "nfs_safe"               # "off" | "nfs_safe" | "full"
 
 [transmitter]
-transport = "packet_mmap"
-interface = "eno2"
-driver    = ""
-mac       = "d4:f5:27:2a:a9:59"   # cfc-865-mkdev30 eno2
-cpu_core  = 4
+transport     = "packet_mmap"
+interface     = "eno3"
+driver        = ""
+mac           = "d4:f5:27:2a:a9:58"   # cfc-865-mkdev30 eno2
+cpu_core      = 4
+ctim_enabled  = false                     # set up WREN CTIM conditions/actions at startup
 
 [receiver]
-transport      = "packet_mmap"
-interface      = "eno2"
-driver         = ""
-mac            = "20:87:56:b6:33:67"   # cfc-865-mkdev16 eno2
-poller_core    = 4
-processor_core = 5
-queue_capacity = 32
+transport         = "packet_mmap"
+interface         = "end0"
+driver            = ""
+mac               = "fc:0f:e7:1b:8b:55"   # cfc-865-mkdev16 eno2
+poller_core       = 1
+processor_core    = 2
+queue_capacity    = 32
+ltim_event_id     = 0                     # LTIM event id to trigger on (0 = disabled)
+ltim_channel      = 0                     # LTIM pulser channel to match
+ltim_pulse_width_us = 1000                # square-pulse width in microseconds
 
 [packet_mmap]
 block_size   = 4096

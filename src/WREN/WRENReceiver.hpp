@@ -8,6 +8,8 @@
 
 #include "TimingEvent.hpp"
 #include "WRENProtocol.hpp"
+#include "fmt/ostream.h"
+
 #include <RingConcepts.hpp>
 #include <cstdio>
 #include <cstring>
@@ -61,29 +63,39 @@ inline void WRENReceiver<Rx, Sink>::parseAndEnqueue(const RxFrame& frame) {
     const auto* p = frame.data.data() + kEthHdrLen;
 
     TimingEvent ev{};
-    if (p[0] == PKT_ADVANCE) {
-        ev.pktType = PKT_ADVANCE;
-        ev.channel = 0;
-        std::memcpy(&ev.eventId, p + 2,  2);
-        std::memcpy(&ev.slot,    p + 4,  2);
-        std::memcpy(&ev.sec,     p + 6,  4);
-        std::memcpy(&ev.nsec,    p + 10, 4);
-        ev.offsetMs = 0;
-    }
-    else if (p[0] == PKT_FIRE) {
+
+    if constexpr (kDebugVerbose) {
+        // Debug: full classification — handles both ADVANCE and FIRE packets
+        if (p[0] == PKT_ADVANCE) {
+            ev.pktType = PKT_ADVANCE;
+            ev.channel = 0;
+            std::memcpy(&ev.eventId, p + 2,  2);
+            std::memcpy(&ev.slot,    p + 4,  2);
+            std::memcpy(&ev.sec,     p + 6,  4);
+            std::memcpy(&ev.nsec,    p + 10, 4);
+            ev.offsetMs = 0;
+        } else if (p[0] == PKT_FIRE) {
+            ev.pktType = PKT_FIRE;
+            std::memcpy(&ev.eventId,  p + 2,  2);
+            std::memcpy(&ev.sec,      p + 4,  4);
+            std::memcpy(&ev.nsec,     p + 8,  4);
+            ev.channel = p[12];
+            ev.slot = 0;
+            std::memcpy(&ev.offsetMs, p + 14, 2);
+        } else {
+            fmt::println("[Error] [WRENReceiver] Unidentified WREN packet received function returning early.");
+            return;
+        }
+    } else {
+        // Release: LTIM-only — PKT_FIRE direct path, no branch overhead
         ev.pktType = PKT_FIRE;
         std::memcpy(&ev.eventId,  p + 2,  2);
         std::memcpy(&ev.sec,      p + 4,  4);
         std::memcpy(&ev.nsec,     p + 8,  4);
         ev.channel = p[12];
-        ev.slot = 0;
         std::memcpy(&ev.offsetMs, p + 14, 2);
     }
-    else {
-        return;
-    }
 
-    // Todo: Add another sink for the DIOT testing so it can generate a square pulse based on a specific LTIM 
     m_sink.push(ev);
 }
 

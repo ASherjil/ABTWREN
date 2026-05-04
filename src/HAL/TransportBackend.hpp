@@ -18,6 +18,7 @@
 #include "WRENCTIMConfigurator.hpp"
 #include "WRENProtocol.hpp"
 #include "WRENTransmitter.hpp"
+#include "ZynqUltraScaleSink.hpp"
 
 #include <AFXDPSocket.hpp>
 #include <AFXDPTx.hpp>
@@ -163,17 +164,25 @@ int runTransmitterWith(Tx& tx, const SidecarConfig& cfg) {
     WRENTransmitter transmitter(WREN_VENDOR_ID, WREN_DEVICE_ID, WREN_BAR, tx);
     transmitter.setMacAddresses(cfg.tx.mac, cfg.rx.mac);
 
-    WRENCTIMConfigurator ctimConfig(transmitter.pcie(), {
-        {142, 24},  // PIX.AMCLO-CT  → pulser 24
-        {143, 25},  // PIX.F900-CT   → pulser 25
-        {138, 26},  // PI2X.F900-CT  → pulser 26
-        {156, 27},  // PX.SCY-CT     → pulser 27 (Start Cycle, needed by MKController)
-    });
-    transmitter.installActionMap(ctimConfig.actionMap());
+    if (cfg.tx.ctimEnabled) {
+        WRENCTIMConfigurator ctimConfig(transmitter.pcie(), {
+            {142, 24},  // PIX.AMCLO-CT  → pulser 24
+            {143, 25},  // PIX.F900-CT   → pulser 25
+            {138, 26},  // PI2X.F900-CT  → pulser 26
+            {156, 27},  // PX.SCY-CT     → pulser 27 (Start Cycle, needed by MKController)
+        });
+        transmitter.installActionMap(ctimConfig.actionMap());
+        std::printf("[TX] PCIe open, MAC set, %zu CTIMs configured, %zu actions mapped. Entering poll loop.\n",
+                    ctimConfig.configuredCount(), ctimConfig.actionMap().size());
+    } else {
+        std::printf("[TX] PCIe open, MAC set, CTIMs disabled. Entering poll loop.\n");
+    }
 
-    std::printf("[TX] PCIe open, MAC set, %zu CTIMs configured, %zu actions mapped. Entering poll loop.\n",
-                ctimConfig.configuredCount(), ctimConfig.actionMap().size());
-    transmitter.transmitAll(g_running);
+    if constexpr (kDebugVerbose) {
+        transmitter.transmitAll(g_running);   // Debug: full capsule decode
+    } else {
+        transmitter.transmitLTIM(g_running);  // Release: LTIM hot path only
+    }
 
     std::printf("[TX] Clean shutdown.\n");
     return 0;
@@ -187,19 +196,28 @@ int runReceiverWith(Rx& rx, const SidecarConfig& cfg) {
 
     NicTuner tuner(cfg.rx.interface.c_str(), cfg.rx.pollerCore, cfg.nicTunerMode);
 
-#ifdef ABTWREN_USE_QUEUE
-    rigtorp::SPSCQueue<TimingEvent> queue(cfg.rx.queueCapacity);
-    QueueSink sink(queue);
-    EventProcessor processor(kShmName, queue);
-    MainReceiver<Rx, QueueSink> receiver(
-        cfg.rx.interface.c_str(), cfg.rx.pollerCore, rx, sink, &processor, cfg.rx.processorCore);
-    runUntilSignal(receiver, cfg.watchdogSec);
-#else
-    ShmSink sink(kShmName);
-    MainReceiver<Rx, ShmSink> receiver(
-        cfg.rx.interface.c_str(), cfg.rx.pollerCore, rx, sink);
-    runUntilSignal(receiver, cfg.watchdogSec);
-#endif
+    if constexpr (kUseQueue) {
+        rigtorp::SPSCQueue<TimingEvent> queue(cfg.rx.queueCapacity);
+        QueueSink sink(queue);
+        EventProcessor processor(kShmName, queue);
+        MainReceiver<Rx, QueueSink> receiver(
+            cfg.rx.interface.c_str(), cfg.rx.pollerCore, rx, sink, &processor, cfg.rx.processorCore);
+        runUntilSignal(receiver, cfg.watchdogSec);
+    } else if constexpr (kPlatform == Platform::aarch64) {
+        TimingEvent matchEvent{};
+        matchEvent.eventId = cfg.rx.ltimEventId;
+        matchEvent.pktType = PKT_FIRE;
+        matchEvent.channel = cfg.rx.ltimChannel;
+        ZynqUltraScaleSink sink(matchEvent, std::chrono::microseconds(cfg.rx.ltimPulseWidthUs));
+        MainReceiver<Rx, ZynqUltraScaleSink> receiver(
+            cfg.rx.interface.c_str(), cfg.rx.pollerCore, rx, sink);
+        runUntilSignal(receiver, cfg.watchdogSec);
+    } else {
+        ShmSink sink(kShmName);
+        MainReceiver<Rx, ShmSink> receiver(
+            cfg.rx.interface.c_str(), cfg.rx.pollerCore, rx, sink);
+        runUntilSignal(receiver, cfg.watchdogSec);
+    }
     return 0;
 }
 

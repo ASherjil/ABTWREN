@@ -8,6 +8,20 @@
 #include <cstddef>
 #include <cstdint>
 
+// ── Build configuration ────────────────────────────────────────────────
+// Single #ifdef location — use if constexpr(kFlag) everywhere else.
+#ifdef NDEBUG
+inline constexpr bool kDebugVerbose = false;
+#else
+inline constexpr bool kDebugVerbose = true;
+#endif
+
+#ifdef ABTWREN_USE_QUEUE
+inline constexpr bool kUseQueue = true;
+#else
+inline constexpr bool kUseQueue = false;
+#endif
+
 // ── WREN PCI identification (CAPS = hardware/register constants) ─────────
 constexpr std::uint16_t WREN_VENDOR_ID = 0x10DC; // CERN
 constexpr std::uint16_t WREN_DEVICE_ID = 0x0455;

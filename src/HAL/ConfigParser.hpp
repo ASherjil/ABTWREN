@@ -26,7 +26,8 @@ struct SidecarConfig {
         std::string                 interface = "eno2";
         std::string                 driver;
         std::array<std::uint8_t, 6> mac{};
-        int                         cpuCore = 4;
+        int                         cpuCore     = 4;
+        bool                        ctimEnabled = true;
     } tx;
 
     // [receiver]
@@ -35,9 +36,12 @@ struct SidecarConfig {
         std::string                 interface = "eno2";
         std::string                 driver;
         std::array<std::uint8_t, 6> mac{};
-        int                         pollerCore    = 4;
-        int                         processorCore = 5;
-        std::size_t                 queueCapacity = 4096;
+        int                         pollerCore       = 4;
+        int                         processorCore    = 5;
+        std::size_t                 queueCapacity    = 4096;
+        std::uint16_t               ltimEventId      = 0;
+        std::uint8_t                ltimChannel       = 0;
+        std::uint32_t               ltimPulseWidthUs = 1000;
     } rx;
 
     // [packet_mmap]
@@ -82,16 +86,20 @@ inline SidecarConfig loadConfig(const char* path) {
     cfg.tx.interface = tbl["transmitter"]["interface"].value_or("eno2"s);
     cfg.tx.driver    = tbl["transmitter"]["driver"].value_or(""s);
     cfg.tx.mac       = parseMac(tbl["transmitter"]["mac"].value_or(""s));
-    cfg.tx.cpuCore   = tbl["transmitter"]["cpu_core"].value_or(4);
+    cfg.tx.cpuCore     = tbl["transmitter"]["cpu_core"].value_or(4);
+    cfg.tx.ctimEnabled = tbl["transmitter"]["ctim_enabled"].value_or(true);
 
     // [receiver]
-    cfg.rx.transport      = tbl["receiver"]["transport"].value_or("packet_mmap"s);
-    cfg.rx.interface      = tbl["receiver"]["interface"].value_or("eno2"s);
-    cfg.rx.driver         = tbl["receiver"]["driver"].value_or(""s);
-    cfg.rx.mac            = parseMac(tbl["receiver"]["mac"].value_or(""s));
-    cfg.rx.pollerCore     = tbl["receiver"]["poller_core"].value_or(4);
-    cfg.rx.processorCore  = tbl["receiver"]["processor_core"].value_or(5);
-    cfg.rx.queueCapacity  = static_cast<std::size_t>(tbl["receiver"]["queue_capacity"].value_or(4096LL));
+    cfg.rx.transport         = tbl["receiver"]["transport"].value_or("packet_mmap"s);
+    cfg.rx.interface         = tbl["receiver"]["interface"].value_or("eno2"s);
+    cfg.rx.driver            = tbl["receiver"]["driver"].value_or(""s);
+    cfg.rx.mac               = parseMac(tbl["receiver"]["mac"].value_or(""s));
+    cfg.rx.pollerCore        = tbl["receiver"]["poller_core"].value_or(4);
+    cfg.rx.processorCore     = tbl["receiver"]["processor_core"].value_or(5);
+    cfg.rx.queueCapacity     = static_cast<std::size_t>(tbl["receiver"]["queue_capacity"].value_or(4096LL));
+    cfg.rx.ltimEventId       = static_cast<std::uint16_t>(tbl["receiver"]["ltim_event_id"].value_or(0LL));
+    cfg.rx.ltimChannel       = static_cast<std::uint8_t>(tbl["receiver"]["ltim_channel"].value_or(0LL));
+    cfg.rx.ltimPulseWidthUs  = static_cast<std::uint32_t>(tbl["receiver"]["ltim_pulse_width_us"].value_or(1000LL));
 
     // [packet_mmap]
     cfg.mmapBlockSize   = static_cast<std::uint32_t>(tbl["packet_mmap"]["block_size"].value_or(4096LL));
