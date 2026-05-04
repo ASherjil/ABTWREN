@@ -20,6 +20,13 @@ echo "1) Debug"
 echo "2) Release"
 read -rp "Build type [1/2]: " type_choice
 
+# ── 4. Queue mode ──
+echo ""
+echo "Enable SPSC queue + EventProcessor thread?"
+echo "1) Off (default — direct ShmSink / ZynqUltraScaleSink)"
+echo "2) On  (QueueSink + EventProcessor)"
+read -rp "Queue mode [1/2]: " queue_choice
+
 # Resolve preset name
 case "${arch_choice}" in
     1) arch="x86_64" ;;
@@ -36,8 +43,15 @@ esac
 preset="${arch}-${type}"
 build_dir="build/${preset}"
 
+# Build cmake args (overrides preset defaults)
+cmake_args="-G Ninja"
+if [[ "${queue_choice}" == "2" ]]; then
+    cmake_args="${cmake_args} -DABTWREN_USE_QUEUE=ON"
+fi
+
 echo ""
 echo "── Preset: ${preset} ──"
+echo "── Queue:  $([[ "${queue_choice}" == "2" ]] && echo "ON" || echo "OFF") ──"
 
 # Clean if requested
 if [[ "${clean_choice}" == "1" ]]; then
@@ -48,7 +62,7 @@ fi
 # Configure if needed
 if [[ ! -f "${build_dir}/build.ninja" ]]; then
     echo "Configuring..."
-    cmake --preset="${preset}" -G Ninja
+    cmake --preset="${preset}" ${cmake_args}
 fi
 
 # Build
