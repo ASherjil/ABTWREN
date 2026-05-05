@@ -78,6 +78,10 @@ inline void WRENTransmitter<Tx>::sendAdvance(std::uint16_t evId, std::uint16_t s
     std::memcpy(p + 10, &nsec, 4);
 
     m_ethernetSocket.commit();
+
+    if constexpr (kDebugVerbose) {
+        fmt::println("[WRENTransmitter] Advanced packet: eventID:{}, slot:{}", evId, slot);
+    }
 }
 
 template<TxRing Tx>
@@ -91,10 +95,15 @@ inline void WRENTransmitter<Tx>::sendFire(const CompEntry& info,
     std::memcpy(p + 2,  &info.eventId, 2);
     std::memcpy(p + 4,  &sec,  4);
     std::memcpy(p + 8,  &nsec, 4);
-    p[12] = info.channel; p[13] = 0;
+    p[12] = info.channel;
+    p[13] = 0;
     std::memcpy(p + 14, &info.offsetMs, 2);
 
     m_ethernetSocket.commit();
+
+    if constexpr (kDebugVerbose) {
+        fmt::println("[WRENTransmitter] LTIM: eventID:{}, channel:{}, offsetMS:{}", info.eventId, info.channel, info.offsetMs);
+    }
 }
 
 // ── Register dump ──────────────────────────────────────────────────

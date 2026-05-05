@@ -113,6 +113,7 @@ std::jthread spawnRxWatchdog(Receiver& receiver, int watchdogSec) {
         }
         std::fprintf(stderr, "\n[Watchdog] %ds timeout. Stopping...\n", watchdogSec);
         receiver.requestStop();
+        g_running = 0;
     });
 }
 

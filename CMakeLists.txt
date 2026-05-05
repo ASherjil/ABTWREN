@@ -30,6 +30,24 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(ABTEdge ABTRDA3 SPSCQueue tomlplusplus)
 
+# ABTRDA3 / ABTEdge inject -fsanitize=address,undefined in Debug builds.
+# Target hardware (mkdev16, mkdev30, mkdev50) has no libasan installed.
+# Strip the sanitizer flags so all code compiles without instrumentation.
+foreach(_flag_target abtrda3_flags abtedge_flags)
+    if(TARGET ${_flag_target})
+        foreach(_prop IN ITEMS INTERFACE_COMPILE_OPTIONS INTERFACE_LINK_OPTIONS)
+            get_target_property(_flags ${_flag_target} ${_prop})
+            if(_flags AND NOT _flags STREQUAL "_flags-NOTFOUND")
+                string(REPLACE "-fsanitize=address,undefined" "" _flags "${_flags}")
+                string(REPLACE "-fsanitize=address" "" _flags "${_flags}")
+                string(REPLACE "-fsanitize=undefined" "" _flags "${_flags}")
+                string(STRIP "${_flags}" _flags)
+                set_target_properties(${_flag_target} PROPERTIES ${_prop} "${_flags}")
+            endif()
+        endforeach()
+    endif()
+endforeach()
+
 # ── Compiler flags ────────────────────────────────────────────────
 add_library(abtwren_flags INTERFACE)
 target_compile_features(abtwren_flags INTERFACE cxx_std_20)

@@ -26,7 +26,7 @@ constexpr int kMaxComp   = 512;
 constexpr int kMaxActIdx = 2048;
 
 struct CompEntry {
-    std::uint16_t eventId{};
+    std::uint16_t eventId{0xFFFF};
     std::uint8_t  channel{0xFF};
     std::uint16_t offsetMs{0xFFFF};
 };
