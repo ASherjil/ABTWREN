@@ -16,7 +16,7 @@ interface     = "eno3"
 driver        = ""
 mac           = "d4:f5:27:2a:a9:58"   # cfc-865-mkdev30 eno2
 cpu_core      = 4
-ctim_enabled  = false                     # set up WREN CTIM conditions/actions at startup
+ctim_enabled  = false                   # set up WREN CTIM conditions/actions at startup
 
 [receiver]
 transport         = "packet_mmap"

@@ -193,7 +193,8 @@ void WRENTransmitter<Tx>::transmitAll(const volatile std::sig_atomic_t& running)
             switch (typ) {
             case TYP_PULSE: {
                 auto comp = static_cast<std::uint16_t>(w1);
-                if (!m_compActive[comp]) break;
+                // comp_map[comp_id] = NO_COMP (0xFFFF) if no action assigned
+                if (comp >= kMaxComp || !m_compActive[comp]) break;
                 std::uint32_t sec, nsec;
                 if (safe64) [[likely]] {
                     std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
@@ -210,14 +211,17 @@ void WRENTransmitter<Tx>::transmitAll(const volatile std::sig_atomic_t& running)
             case TYP_CONFIG: {
                 const auto actIdx = static_cast<std::uint16_t>(w1);
                 const auto swCmp  = static_cast<std::uint16_t>(w1 >> 16);
+                fmt::println(stderr, "[CONFIG] actIdx={} swCmp={} metaEid={}",
+                             actIdx, swCmp, m_actMeta[actIdx].eventId);
+                // Only accept CONFIG capsules for actions we installed
+                if (swCmp >= kMaxComp || actIdx >= kMaxActIdx) break;
+                if (m_actMeta[actIdx].eventId == 0xFFFF) break;
                 m_compInfo[swCmp] = m_actMeta[actIdx];
                 m_compActive[swCmp] = true;
                 break;
             }
             case TYP_EVENT: {
                 auto evId = static_cast<std::uint16_t>(w1);
-                auto [targets, count] = resolveCtimToSlots(evId);
-                if (count == 0) break;
                 std::uint32_t nsec, sec;
                 if (safe64) [[likely]] {
                     std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
@@ -228,8 +232,25 @@ void WRENTransmitter<Tx>::transmitAll(const volatile std::sig_atomic_t& running)
                     nsec = readRingWord(m_shadowOff + 2);
                     sec  = readRingWord(m_shadowOff + 3);
                 }
+
+                // ADVANCE: hardcoded kTargets slot mappings (legacy)
+                auto [targets, count] = resolveCtimToSlots(evId);
                 for (int i = 0; i < count; ++i)
                     sendAdvance(evId, targets[i].ltim_slot, sec, nsec);
+
+                // FIRE: discovered event-bound LTIMs (no firmware comparators consumed)
+                for (int i = 0; i < kMaxActIdx; ++i) {
+                    if (m_actMeta[i].eventId == evId
+                        && m_actMeta[i].eventId != 0
+                        && m_actMeta[i].eventId != 0xFFFF) {
+                        if constexpr (kDebugVerbose) {
+                            fmt::println(stderr, "[TX] FIRE evId={} ch={} oms={}",
+                                         evId, m_actMeta[i].channel,
+                                         m_actMeta[i].offsetMs);
+                        }
+                        sendFire(m_actMeta[i], sec, nsec);
+                    }
+                }
                 break;
             }
             case TYP_CONTEXT:
@@ -280,7 +301,7 @@ inline void WRENTransmitter<Tx>::transmitLTIM(const volatile std::sig_atomic_t& 
 
             if (typ == TYP_PULSE) {
                 auto comp = static_cast<std::uint16_t>(w1);
-                if (m_compActive[comp]) [[likely]] {
+                if (comp < kMaxComp && m_compActive[comp]) [[likely]] {
                     std::uint32_t sec, nsec;
                     if (safe64) [[likely]] {
                         std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
@@ -294,14 +315,35 @@ inline void WRENTransmitter<Tx>::transmitLTIM(const volatile std::sig_atomic_t& 
                     sendFire(m_compInfo[comp], sec, nsec);
                 }
             }
+            else if (typ == TYP_EVENT) {
+                auto evId = static_cast<std::uint16_t>(w1);
+                std::uint32_t nsec, sec;
+                if (safe64) [[likely]] {
+                    std::uint64_t w2w3 = *m_pcieHandler.registerPtr<std::uint64_t>(
+                        WREN_ASYNC_DATA_BASE + (m_shadowOff + 2) * 4);
+                    nsec = static_cast<std::uint32_t>(w2w3);
+                    sec  = static_cast<std::uint32_t>(w2w3 >> 32);
+                } else {
+                    nsec = readRingWord(m_shadowOff + 2);
+                    sec  = readRingWord(m_shadowOff + 3);
+                }
+                // EVENT→FIRE: discovered LTIM actions (bypasses comparator pool)
+                for (int i = 0; i < kMaxActIdx; ++i) {
+                    if (m_actMeta[i].eventId == evId
+                        && m_actMeta[i].eventId != 0
+                        && m_actMeta[i].eventId != 0xFFFF) {
+                        sendFire(m_actMeta[i], sec, nsec);
+                    }
+                }
+            }
             else if (typ == TYP_CONFIG) {
                 const auto actIdx = static_cast<std::uint16_t>(w1);
                 const auto swCmp  = static_cast<std::uint16_t>(w1 >> 16);
+                if (swCmp >= kMaxComp || actIdx >= kMaxActIdx) break;
+                if (m_actMeta[actIdx].eventId == 0xFFFF) break;
                 m_compInfo[swCmp] = m_actMeta[actIdx];
                 m_compActive[swCmp] = true;
-                // No TX packet — metadata setup only
             }
-            // Drop everything else (EVENT, CONTEXT, unknown) — LTIM hot path
 
             m_shadowOff = (m_shadowOff + len) & RING_MASK;
         } while (m_shadowOff != boardOff);

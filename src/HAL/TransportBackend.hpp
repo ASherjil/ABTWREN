@@ -165,18 +165,27 @@ int runTransmitterWith(Tx& tx, const SidecarConfig& cfg) {
     WRENTransmitter transmitter(WREN_VENDOR_ID, WREN_DEVICE_ID, WREN_BAR, tx);
     transmitter.setMacAddresses(cfg.tx.mac, cfg.rx.mac);
 
+    // Always discover existing firmware actions (both wrentest's LTIMs and our own)
+    // so CONFIG→PULSE forwarding has correct eventId/channel/offset data.
+    // Only create new CTIM conditions/actions when enabled.
+    std::vector<CtimTarget> ctimTargets;
     if (cfg.tx.ctimEnabled) {
-        WRENCTIMConfigurator ctimConfig(transmitter.pcie(), {
+        ctimTargets = {
             {142, 24},  // PIX.AMCLO-CT  → pulser 24
             {143, 25},  // PIX.F900-CT   → pulser 25
             {138, 26},  // PI2X.F900-CT  → pulser 26
             {156, 27},  // PX.SCY-CT     → pulser 27 (Start Cycle, needed by MKController)
-        });
-        transmitter.installActionMap(ctimConfig.actionMap());
+        };
+    }
+    WRENCTIMConfigurator ctimConfig(transmitter.pcie(), ctimTargets);
+    transmitter.installActionMap(ctimConfig.actionMap());
+
+    if (cfg.tx.ctimEnabled) {
         std::printf("[TX] PCIe open, MAC set, %zu CTIMs configured, %zu actions mapped. Entering poll loop.\n",
                     ctimConfig.configuredCount(), ctimConfig.actionMap().size());
     } else {
-        std::printf("[TX] PCIe open, MAC set, CTIMs disabled. Entering poll loop.\n");
+        std::printf("[TX] PCIe open, MAC set, CTIMs disabled, %zu existing actions mapped. Entering poll loop.\n",
+                    ctimConfig.actionMap().size());
     }
 
     if constexpr (kDebugVerbose) {
